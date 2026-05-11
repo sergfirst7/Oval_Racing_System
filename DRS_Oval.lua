@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System v3.4 (STABLE START)
--- Aggressive Session Detection | Fixed Auto-Green
+-- DRS World: Oval Racing System v3.5 (FIXED STABLE)
+-- Fixed Typo in UI | Aggressive Session Detection
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3, STARTING = 4 }
 local currentFlag = STATE.STARTING
@@ -23,16 +23,11 @@ local trackLength = sim and sim.trackLengthM or 1000
 local scPos = 0 
 local scSpeed = 120 / 3.6
 
--- НОВАЯ ЛОГИКА: Разрешаем всё, кроме Практики и Квалы
 local function isRaceSession()
     if forceUI then return true end
     local s = ac.getSim()
     if not s then return false end
-    
-    -- Если мы ТОЧНО знаем, что это не гонка - выключаем
     if s.sessionType == 0 or s.sessionType == 1 then return false end
-    
-    -- В остальное время (включая старт гонки, когда имя еще не пришло) - РАБОТАЕМ
     return true
 end
 
@@ -106,7 +101,6 @@ function script.update(dt)
             initializedSC = true
         end
 
-        -- Переход на GREEN через полкруга
         if currentFlag == STATE.STARTING and me.splinePosition > 0.5 then
             currentFlag = STATE.GREEN
             ac.sendChatMessage("GREEN FLAG! GO! !green")
@@ -207,7 +201,7 @@ function script.drawUI()
             
             if currentFlag ~= STATE.GREEN then
                 local followText = "FOLLOW: " .. targetCarName
-                local followSize = ui.measureText(followSize)
+                local followSize = ui.measureText(followText) -- FIXED TYPO HERE
                 ui.setCursor(vec2(centerX - followSize.x/2, 82))
                 ui.textColored(followText, rgbm(0, 0, 0, 1))
                 
@@ -239,6 +233,6 @@ function script.drawUI()
         
         ui.setCursor(vec2(10, 10))
         local s = ac.getSim()
-        ui.text("v3.4 | Session: " .. (s.sessionName or "N/A") .. " | Type: " .. s.sessionType)
+        ui.text("v3.5 | Session: " .. (s.sessionName or "N/A") .. " | Type: " .. s.sessionType)
     end)
 end
