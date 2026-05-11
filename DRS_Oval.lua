@@ -1,31 +1,38 @@
--- DRS World: Oval Racing System v2.9 (ROLLING START EDITION)
--- SC Speed: 120 kmh | Overtake Penalty | Race Only
+-- DRS World: Oval Racing System v3.0 (STABLE ROLLING START)
+-- Fixed SC Logic | Symmetrical UI | Race Only
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3, STARTING = 4 }
-local currentFlag = STATE.STARTING -- Начинаем с процедуры старта
+local currentFlag = STATE.STARTING
 local targetCarID = -1
 local targetCarName = "NONE"
 local restartTimer = 0
 
 -- Caution & Penalties
-local yellowCooldown = 60 -- Запрет на новые флаги сразу после старта
+local yellowCooldown = 60
 local slowTimers = {}
 local cautionStartLap = 0
 local overtakeTimer = 0
 local penaltyAppliedTimer = 0
 local sessionStartTimer = 0
+local initializedSC = false -- Флаг разовой инициализации Сейфтикара
 
 -- Track info
 local trackLength = ac.getSim().trackLengthM
 local scPos = 0 
-local scSpeed = 120 / 3.6 -- Скорректировано до 120 км/ч
+local scSpeed = 120 / 3.6
 
+-- ЖЕСТКАЯ ПРОВЕРКА СЕССИИ (Только Race)
 local function isRaceSession()
     local sim = ac.getSim()
-    if not sim then return true end
-    local ok, res = pcall(function() return string.find(sim.sessionName, "Race") ~= nil end)
-    if ok then return res end
-    return true 
+    if not sim then return false end
+    local isRace = false
+    pcall(function() 
+        -- Проверка типа (2 = Race) или имени
+        if sim.sessionType == 2 or string.find(sim.sessionName, "Race") then
+            isRace = true
+        end
+    end)
+    return isRace
 end
 
 local function safeName(id)
@@ -56,8 +63,8 @@ local function getSideText(id)
     return ""
 end
 
--- Инициализация цели при старте или флаге
-local function updateTarget()
+-- Инициализация цели (Вызывается ТОЛЬКО при смене состояния)
+local function initTarget()
     local order = {}
     for i = 0, ac.getSim().carsCount - 1 do
         local car = ac.getCar(i)
@@ -75,7 +82,8 @@ local function updateTarget()
                 targetCarID = order[i-1].id
                 targetCarName = order[i-1].name
             else 
-                scPos = (entry.spline + 60/trackLength) % 1
+                -- Мы лидеры, инициализируем SC перед собой
+                scPos = (entry.spline + 80/trackLength) % 1
             end
             break
         end
@@ -87,7 +95,7 @@ local function triggerCaution()
     currentFlag = STATE.CAUTION
     restartTimer = 0
     cautionStartLap = ac.getCar(0).lapCount
-    updateTarget()
+    initTarget()
 end
 
 function script.update(dt)
@@ -100,8 +108,14 @@ function script.update(dt)
     
     local me = ac.getCar(0)
 
-    -- Детектор аварий (включается только через 30 сек гонки)
-    if currentFlag == STATE.GREEN and yellowCooldown <= 0 and sessionStartTimer > 30 then
+    -- Разовая инициализация при самом первом запуске сессии
+    if not initializedSC then
+        initTarget()
+        initializedSC = true
+    end
+
+    -- Детектор аварий
+    if currentFlag == STATE.GREEN and yellowCooldown <= 0 and sessionStartTimer > 40 then
         for i = 0, ac.getSim().carsCount - 1 do
             local car = ac.getCar(i)
             if car and car.isConnected and not car.isInPitlane and car.speedKmh < 40 then
@@ -118,13 +132,11 @@ function script.update(dt)
         end
     end
 
-    -- Логика под флагом / на старте
+    -- Логика движения под флагом
     if currentFlag ~= STATE.GREEN then
+        -- Виртуальный SC движется независимо
         scPos = (scPos + (scSpeed * dt) / trackLength) % 1
         
-        -- Обновляем цель раз в секунду
-        if math.floor(sessionStartTimer) % 2 == 0 then updateTarget() end
-
         local distToTarget = 0
         if targetCarID == -1 then
             distToTarget = (scPos - me.splinePosition) * trackLength
@@ -134,10 +146,10 @@ function script.update(dt)
         end
         if distToTarget < -trackLength/2 then distToTarget = distToTarget + trackLength end
 
-        -- Штраф за обгон
+        -- Штраф за обгон (лимит 3 метра, задержка 1 сек)
         if distToTarget < -3 then
             overtakeTimer = overtakeTimer + dt
-            if overtakeTimer > 1.0 then -- Штраф через 1 секунду обгона
+            if overtakeTimer > 1.0 then
                 applyRealPenalty(0, 10)
                 overtakeTimer = -10
             end
@@ -145,7 +157,7 @@ function script.update(dt)
             overtakeTimer = math.max(0, overtakeTimer - dt)
         end
 
-        -- Авто-рестарт (только если это не самый старт сессии)
+        -- Авто-рестарт
         if currentFlag ~= STATE.STARTING then
             local lapsPassed = me.lapCount - cautionStartLap
             if lapsPassed >= 2 then
@@ -176,8 +188,8 @@ function script.drawUI()
     local showBlock = (currentFlag ~= STATE.GREEN) or (restartTimer > 0)
     
     if showBlock then
-        local boxW = 400
-        local boxH = 160
+        local boxW = 380
+        local boxH = 142 -- Уменьшено для симметрии
         local bgColor = currentFlag == STATE.GREEN and rgbm(0, 0.8, 0, 1) or rgbm(1, 1, 0, 1)
         
         ui.drawRectFilled(vec2(centerX - boxW/2, 40), vec2(centerX + boxW/2, 40 + boxH), bgColor, 12)
@@ -196,13 +208,13 @@ function script.drawUI()
         if currentFlag ~= STATE.GREEN then
             local followText = "FOLLOW: " .. targetCarName
             local followSize = ui.measureText(followText)
-            ui.setCursor(vec2(centerX - followSize.x/2, 85))
+            ui.setCursor(vec2(centerX - followSize.x/2, 82))
             ui.textColored(followText, rgbm(0, 0, 0, 1))
             
             local sideText = getSideText(0)
             local sideSize = ui.measureText(sideText)
-            ui.setCursor(vec2(centerX - sideSize.x/2, 105))
-            ui.textColored(sideText, rgbm(0, 0.2, 0.8, 1)) -- Синий для сторон
+            ui.setCursor(vec2(centerX - sideSize.x/2, 102))
+            ui.textColored(sideText, rgbm(0, 0.2, 0.8, 1))
             
             local me = ac.getCar(0)
             local dist = targetCarID == -1 and (scPos - me.splinePosition) * trackLength or (ac.getCar(targetCarID).splinePosition - me.splinePosition) * trackLength
@@ -212,7 +224,7 @@ function script.drawUI()
             local dText = math.floor(dist) .. "m"
             local dSize = ui.measureText(dText)
             local dColor = (dist < 10 or dist > 50) and rgbm(1, 0, 0, 1) or rgbm(0, 0, 0, 1)
-            ui.setCursor(vec2(centerX - dSize.x/2, 125))
+            ui.setCursor(vec2(centerX - dSize.x/2, 118))
             ui.textColored(dText, dColor)
             ui.popFont()
         end
@@ -227,5 +239,5 @@ function script.drawUI()
     end
     
     ui.setCursor(vec2(10, 10))
-    ui.text("DRS Oval v2.9")
+    ui.text("DRS Oval v3.0 STABLE")
 end
