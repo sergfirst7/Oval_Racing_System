@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System v2.3 (PRO STEWARD)
--- Race Only + Rolling Start Sides + Player Overtake Penalties
+-- DRS World: Oval Racing System v2.4 (REAL PENALTIES)
+-- Race Only + Rolling Start + Real Server Penalties
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
@@ -12,7 +12,7 @@ local yellowCooldown = 0
 local slowTimers = {}
 local cautionStartLap = 0
 local overtakeTimer = 0
-local startOvertakeTimer = 0
+local penaltyAppliedTimer = 0 -- Для уведомления на экране
 
 -- Track info
 local trackLength = ac.getSim().trackLengthM
@@ -24,7 +24,12 @@ local function safeName(id)
     return (name and name ~= "") and name or "Driver #"..id
 end
 
--- Функция определения стороны (Left/Right)
+-- Применение реального штрафа через серверную команду
+local function applyRealPenalty(id, seconds)
+    ac.sendChatMessage("!penalty #" .. id .. " " .. seconds)
+    penaltyAppliedTimer = 5.0 -- Показываем уведомление на экране 5 секунд
+end
+
 local function getSideText(id)
     local order = {}
     for i = 0, ac.getSim().carsCount - 1 do
@@ -78,14 +83,15 @@ end
 
 function script.update(dt)
     local sim = ac.getSim()
-    if sim.sessionType ~= ac.SessionType.Race then return end -- Спим в Практике/Квале
+    if sim.sessionType ~= ac.SessionType.Race then return end
 
     if restartTimer > 0 then restartTimer = restartTimer - dt end
     if yellowCooldown > 0 then yellowCooldown = yellowCooldown - dt end
+    if penaltyAppliedTimer > 0 then penaltyAppliedTimer = penaltyAppliedTimer - dt end
     
     local me = ac.getCar(0)
     
-    -- АВТО-ДЕТЕКТОР (только если гонка уже идет)
+    -- Детектор аварий
     if currentFlag == STATE.GREEN and yellowCooldown <= 0 then
         for i = 0, sim.carsCount - 1 do
             local car = ac.getCar(i)
@@ -103,11 +109,10 @@ function script.update(dt)
         end
     end
 
-    -- СУДЕЙСТВО
+    -- Судейство под желтым флагом
     if currentFlag ~= STATE.GREEN then
         scPos = (scPos + (scSpeed * dt) / trackLength) % 1
         
-        -- Проверка обгона игрока или SC
         local distToTarget = 0
         if targetCarID == -1 then
             distToTarget = (scPos - me.splinePosition) * trackLength
@@ -117,32 +122,25 @@ function script.update(dt)
         end
         if distToTarget < -trackLength/2 then distToTarget = distToTarget + trackLength end
 
-        if distToTarget < -2 then -- Обгон зафиксирован
+        if distToTarget < -2 then
             overtakeTimer = overtakeTimer + dt
             if overtakeTimer > 3.0 then
-                ac.sendChatMessage("PENALTY +10s: " .. safeName(0) .. " ILLEGAL OVERTAKE!")
-                overtakeTimer = -10 -- Кулдаун
+                applyRealPenalty(0, 10) -- РЕАЛЬНЫЙ ШТРАФ
+                overtakeTimer = -10
             end
         else
             overtakeTimer = math.max(0, overtakeTimer - dt)
         end
 
-        -- Авто-рестарт через 2 круга
         local lapsPassed = me.lapCount - cautionStartLap
         if lapsPassed >= 2 then
             currentFlag = STATE.GREEN
             targetCarID = -1
             restartTimer = 5.0
-            startOvertakeTimer = 1.0 -- Даем секунду на проверку фальстарта
             ac.sendChatMessage("GREEN FLAG! GO! !green")
         elseif lapsPassed >= 1.5 and currentFlag == STATE.CAUTION then
             currentFlag = STATE.ONE_TO_GREEN
         end
-    end
-    
-    -- Фальстарт (первая секунда зеленого флага)
-    if currentFlag == STATE.GREEN and startOvertakeTimer > 0 then
-        startOvertakeTimer = startOvertakeTimer - dt
     end
 end
 
@@ -152,7 +150,6 @@ ac.onChatMessage(function(msg, senderID)
     elseif string.find(text, "!green") then 
         currentFlag = STATE.GREEN 
         restartTimer = 5.0
-        startOvertakeTimer = 1.0
     end
 end)
 
@@ -181,27 +178,18 @@ function script.drawUI()
         ui.popFont()
         
         if currentFlag ~= STATE.GREEN then
-            -- FOLLOW INFO
             local followText = "FOLLOW: " .. targetCarName
             local followSize = ui.measureText(followText)
             ui.setCursor(vec2(centerX - followSize.x/2, 85))
             ui.textColored(followText, rgbm(0, 0, 0, 1))
             
-            -- SIDE INFO (Rolling Start Prep)
             local sideText = getSideText(0)
             local sideSize = ui.measureText(sideText)
             ui.setCursor(vec2(centerX - sideSize.x/2, 105))
             ui.textColored(sideText, rgbm(0, 0, 0, 1))
             
-            -- DISTANCE
             local me = ac.getCar(0)
-            local dist = 0
-            if targetCarID == -1 then
-                dist = (scPos - me.splinePosition) * trackLength
-            else
-                local tCar = ac.getCar(targetCarID)
-                dist = (tCar.splinePosition - me.splinePosition) * trackLength
-            end
+            local dist = targetCarID == -1 and (scPos - me.splinePosition) * trackLength or (ac.getCar(targetCarID).splinePosition - me.splinePosition) * trackLength
             if dist < -trackLength/2 then dist = dist + trackLength end
 
             ui.pushFont(ui.Font.Title)
@@ -211,18 +199,18 @@ function script.drawUI()
             ui.setCursor(vec2(centerX - dSize.x/2, 125))
             ui.textColored(dText, dColor)
             ui.popFont()
-
-            -- Таймер штрафа
-            if overtakeTimer > 0 then
-                ui.drawRectFilled(vec2(centerX - 250, 200), vec2(centerX + 250, 250), rgbm(1, 0, 0, 0.9), 5)
-                ui.setCursor(vec2(centerX - 230, 210))
-                ui.pushFont(ui.Font.Title)
-                ui.textColored("OVERTAKE! PENALTY IN: " .. string.format("%.1f", 3.0 - overtakeTimer) .. "s", rgbm(1, 1, 1, 1))
-                ui.popFont()
-            end
         end
+    end
+
+    -- Уведомление о примененном штрафе
+    if penaltyAppliedTimer > 0 then
+        ui.drawRectFilled(vec2(centerX - 250, 200), vec2(centerX + 250, 250), rgbm(1, 0, 0, 0.95), 8)
+        ui.setCursor(vec2(centerX - 230, 210))
+        ui.pushFont(ui.Font.Title)
+        ui.textColored("REAL PENALTY APPLIED: +10s", rgbm(1, 1, 1, 1))
+        ui.popFont()
     end
     
     ui.setCursor(vec2(10, 10))
-    ui.text("DRS Oval v2.3 STEWARD")
+    ui.text("DRS Oval v2.4 REAL-TIME")
 end
