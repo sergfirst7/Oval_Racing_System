@@ -1,11 +1,11 @@
--- DRS World: Oval Racing System v2.1 (FINAL CLEAN)
--- Fixed caching + Large Fonts + Removed ghost text
+-- DRS World: Oval Racing System v2.2 (COMPACT)
+-- Tight UI + Same Logic
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
 local targetCarID = -1
 local targetCarName = "NONE"
-local restartTimer = 0 -- Таймер для зеленого блока
+local restartTimer = 0
 
 -- Caution Tracking
 local yellowCooldown = 0
@@ -122,28 +122,26 @@ function script.drawUI()
     local showBlock = (currentFlag ~= STATE.GREEN) or (restartTimer > 0)
     
     if showBlock then
-        local boxW = 450
-        local boxH = 160
+        local boxW = 360 -- Уменьшено
+        local boxH = 125 -- Уменьшено
         local bgColor = currentFlag == STATE.GREEN and rgbm(0, 0.8, 0, 1) or rgbm(1, 1, 0, 1)
         
-        ui.drawRectFilled(vec2(centerX - boxW/2, 40), vec2(centerX + boxW/2, 40 + boxH), bgColor, 15)
+        ui.drawRectFilled(vec2(centerX - boxW/2, 40), vec2(centerX + boxW/2, 40 + boxH), bgColor, 12)
         
-        -- ЗАГОЛОВОК (Крупный)
         local title = "YELLOW FLAG"
         if currentFlag == STATE.GREEN then title = "GREEN FLAG / GO!" 
         elseif currentFlag == STATE.ONE_TO_GREEN then title = "ONE TO GREEN" end
         
         ui.pushFont(ui.Font.Title)
         local titleSize = ui.measureText(title)
-        ui.setCursor(vec2(centerX - titleSize.x/2, 50))
+        ui.setCursor(vec2(centerX - titleSize.x/2, 48))
         ui.textColored(title, rgbm(0, 0, 0, 1))
         ui.popFont()
         
-        -- ИНФО (Только если не зеленый старт)
         if currentFlag ~= STATE.GREEN then
             local followText = "FOLLOW: " .. targetCarName
             local followSize = ui.measureText(followText)
-            ui.setCursor(vec2(centerX - followSize.x/2, 95))
+            ui.setCursor(vec2(centerX - followSize.x/2, 85))
             ui.textColored(followText, rgbm(0, 0, 0, 1))
             
             if targetCarName == "SAFETY CAR" then
@@ -156,14 +154,14 @@ function script.drawUI()
                 
                 ui.pushFont(ui.Font.Title)
                 local dSize = ui.measureText(dText)
-                ui.setCursor(vec2(centerX - dSize.x/2, 115))
+                ui.setCursor(vec2(centerX - dSize.x/2, 100))
                 ui.textColored(dText, dColor)
                 ui.popFont()
                 
-                -- Таймер штрафа
+                -- Таймер штрафа (чуть выше, чтобы не вылезал)
                 if scOvertakeTimer > 0 then
-                    ui.drawRectFilled(vec2(centerX - 250, 210), vec2(centerX + 250, 260), rgbm(1, 0, 0, 0.9), 5)
-                    ui.setCursor(vec2(centerX - 230, 210))
+                    ui.drawRectFilled(vec2(centerX - 250, 170), vec2(centerX + 250, 220), rgbm(1, 0, 0, 0.9), 5)
+                    ui.setCursor(vec2(centerX - 230, 180))
                     ui.pushFont(ui.Font.Title)
                     ui.textColored("REDUCE SPEED! PENALTY: " .. string.format("%.1f", 3.0 - scOvertakeTimer) .. "s", rgbm(1, 1, 1, 1))
                     ui.popFont()
@@ -173,5 +171,5 @@ function script.drawUI()
     end
     
     ui.setCursor(vec2(10, 10))
-    ui.text("DRS Oval v2.1")
+    ui.text("DRS Oval v2.2")
 end
