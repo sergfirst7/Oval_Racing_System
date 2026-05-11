@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System v2.7 (ULTRA COMPATIBILITY)
--- Protected Session Check + Real Penalties
+-- DRS World: Oval Racing System v2.8 (FORCE REFRESH)
+-- Race Only + Real Penalties + Crash Proof
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
@@ -19,19 +19,18 @@ local trackLength = ac.getSim().trackLengthM
 local scPos = 0 
 local scSpeed = 80 / 3.6
 
--- БЕЗОПАСНАЯ ПРОВЕРКА СЕССИИ (Для серверных скриптов)
+-- БЕЗОПАСНАЯ ПРОВЕРКА СЕССИИ
 local function isRaceSession()
     local sim = ac.getSim()
     if not sim then return true end
     
-    -- Пробуем разные способы
     local ok, res = pcall(function() return string.find(sim.sessionName, "Race") ~= nil end)
     if ok then return res end
     
     local ok2, res2 = pcall(function() return sim.sessionType == 2 end)
     if ok2 then return res2 end
 
-    return true -- Если не удалось определить, разрешаем работу
+    return true 
 end
 
 local function safeName(id)
@@ -221,5 +220,5 @@ function script.drawUI()
     end
     
     ui.setCursor(vec2(10, 10))
-    ui.text("DRS Oval v2.7 PROTECTED")
+    ui.text("DRS Oval v2.8")
 end
