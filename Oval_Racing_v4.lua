@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System v4.2 (TIMER FIX)
--- Green HUD disappears after 2s | Guaranteed timer logic
+-- DRS World: Oval Racing System v4.3 (FAST RESPONSE)
+-- Caution triggers after 2s of slow driving | Quick start readiness
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
@@ -9,7 +9,7 @@ local targetCarName = "NONE"
 local restartTimer = 0
 
 -- Caution & Penalties
-local yellowCooldown = 30
+local yellowCooldown = 5 -- Уменьшил до 5 сек для быстрого старта
 local slowTimers = {}
 local cautionStartLap = 0
 local overtakeTimer = 0
@@ -77,7 +77,6 @@ local function initTarget()
 end
 
 function script.update(dt)
-    -- ГАРАНТИРОВАННОЕ УМЕНЬШЕНИЕ ТАЙМЕРА
     if restartTimer > 0 then restartTimer = restartTimer - dt end
     if penaltyAppliedTimer > 0 then penaltyAppliedTimer = penaltyAppliedTimer - dt end
     if yellowCooldown > 0 then yellowCooldown = yellowCooldown - dt end
@@ -90,25 +89,25 @@ function script.update(dt)
             lastSessionIndex = s.sessionIndex
             currentFlag = STATE.GREEN
             sessionStartTimer = 0
-            restartTimer = 0 -- Сброс при смене сессии
+            yellowCooldown = 5 -- Быстрая готовность при смене сессии
         end
 
         sessionStartTimer = sessionStartTimer + dt
         local me = ac.getCar(0)
         if not me then return end
 
-        -- Авто-Желтый
-        if currentFlag == STATE.GREEN and yellowCooldown <= 0 and sessionStartTimer > 10 then
+        -- Авто-Желтый (Реакция 2 секунды)
+        if currentFlag == STATE.GREEN and yellowCooldown <= 0 and sessionStartTimer > 5 then
             for i = 0, ac.getSim().carsCount - 1 do
                 local car = ac.getCar(i)
                 if car and car.isConnected and not car.isInPitlane and car.speedKmh < 40 then
                     slowTimers[i] = (slowTimers[i] or 0) + dt
-                    if slowTimers[i] > 4.0 then
+                    if slowTimers[i] > 2.0 then -- ТЕПЕРЬ 2 СЕКУНДЫ
                         ac.sendChatMessage("CAUTION! !yellow")
                         currentFlag = STATE.CAUTION
                         cautionStartLap = me.lapCount
                         initTarget()
-                        yellowCooldown = 30
+                        yellowCooldown = 30 -- Защита от спама после активации
                         break
                     end
                 else
@@ -138,12 +137,11 @@ function script.update(dt)
                 overtakeTimer = math.max(0, overtakeTimer - dt)
             end
 
-            -- Авто-выход
             local lapsPassed = me.lapCount - cautionStartLap
             if lapsPassed >= 2 then
                 currentFlag = STATE.GREEN
                 targetCarID = -1
-                restartTimer = 2.0 -- 2 секунды на исчезновение
+                restartTimer = 2.0
             elseif lapsPassed >= 1.5 then
                 currentFlag = STATE.ONE_TO_GREEN
             end
@@ -158,9 +156,11 @@ ac.onChatMessage(function(msg, senderID)
         currentFlag = STATE.CAUTION
         cautionStartLap = ac.getCar(0).lapCount
         initTarget()
+        yellowCooldown = 30
     elseif string.find(text, "!green") then 
         currentFlag = STATE.GREEN 
-        restartTimer = 2.0 -- 2 СЕКУНДЫ
+        restartTimer = 2.0
+        yellowCooldown = 10
     end
 end)
 
