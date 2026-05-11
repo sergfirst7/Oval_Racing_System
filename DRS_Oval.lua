@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System (CSP Online Script)
--- Handles State Machine, Sync and HUD
+-- DRS World: Oval Racing System (CSP Online Script) v1.1
+-- Fixed onCollision error by removing physics hooks not supported in Online Scripts
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
@@ -9,9 +9,8 @@ local messageTimer = 0
 
 -- Config
 local CAUTION_SPEED = 80
-local COLLISION_THRESHOLD = 500
 
--- Safe Wrapper (as per DRS standards)
+-- Safe Wrapper
 local function safe(fn)
     return function(...)
         local ok, err = pcall(fn, ...)
@@ -42,35 +41,29 @@ end
 
 -- Chat Sync
 ac.onChatMessage(safe(function(msg, senderID)
-    if string.find(msg, "!yellow") or string.find(msg, "YELLOW FLAG") then
+    local text = msg:lower()
+    if string.find(text, "!yellow") or string.find(msg:upper(), "YELLOW FLAG") then
         currentFlag = STATE.CAUTION
         message = "YELLOW FLAG - CAUTION"
         messageTimer = 5
         
         local order = getRaceOrder()
         for i, entry in ipairs(order) do
-            if entry.id == 0 then -- Local player
+            if entry.id == 0 then
                 if i > 1 then targetCarName = order[i-1].name
                 else targetCarName = "PACE CAR" end
                 break
             end
         end
-    elseif string.find(msg, "!green") or string.find(msg, "GREEN FLAG") then
+    elseif string.find(text, "!green") or string.find(msg:upper(), "GREEN FLAG") then
         currentFlag = STATE.GREEN
         targetCarName = ""
         message = "GREEN FLAG! GO!"
         messageTimer = 3
-    elseif string.find(msg, "!one") or string.find(msg, "ONE TO GREEN") then
+    elseif string.find(text, "!one") or string.find(msg:upper(), "ONE TO GREEN") then
         currentFlag = STATE.ONE_TO_GREEN
         message = "ONE TO GREEN - PREPARE"
         messageTimer = 5
-    end
-end))
-
--- Auto-Caution on heavy hits
-ac.onCollision(safe(function(withCarID, intensity)
-    if intensity > COLLISION_THRESHOLD and currentFlag == STATE.GREEN then
-        ac.sendChatMessage("ACCIDENT! !yellow")
     end
 end))
 
@@ -80,16 +73,16 @@ function script.drawUI()
     
     if currentFlag ~= STATE.GREEN then
         local color = currentFlag == STATE.CAUTION and rgbm(1, 1, 0, 1) or rgbm(1, 0.5, 0, 1)
-        ui.drawRectFilled(vec2(centerX - 150, 40), vec2(centerX + 150, 90), color, 5)
+        ui.drawRectFilled(vec2(centerX - 150, 40), vec2(centerX + 150, 95), color, 5)
         
-        ui.setCursor(vec2(centerX - 100, 55))
+        ui.setCursor(vec2(centerX - 110, 55))
         ui.pushFont(ui.Font.Title)
-        ui.textColored(currentFlag == STATE.CAUTION and "YELLOW FLAG" or "ONE TO GREEN", rgbm(0, 0, 0, 1))
+        ui.textColored(currentFlag == STATE.CAUTION and " YELLOW FLAG" or "ONE TO GREEN", rgbm(0, 0, 0, 1))
         ui.popFont()
         
         if targetCarName ~= "" then
-            ui.setCursor(vec2(centerX - 80, 100))
-            ui.text("FOLLOW: " .. targetCarName)
+            ui.setCursor(vec2(centerX - 100, 105))
+            ui.text("STAY BEHIND: " .. targetCarName)
         end
     end
     
