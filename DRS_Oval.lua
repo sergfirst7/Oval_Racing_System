@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System v1.2
--- Virtual Safety Car + Overtake Penalties
+-- DRS World: Oval Racing System v1.3 (FULL AUTO)
+-- Auto-Caution on slow cars (<40kmh for 3s)
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
@@ -8,12 +8,14 @@ local targetCarName = ""
 local message = ""
 local messageTimer = 0
 
--- Safety Car Logic
-local scPos = 0 -- Позиция сейфти-кара на сплайне (0-1)
-local scSpeed = 80 / 3.6 -- 80 км/ч в м/с
-local trackLength = ac.getSim().trackLengthM
+-- Slow Car Detection
+local slowTimers = {} -- Таймеры для каждой машины
+local yellowCooldown = 0
 
--- Penalty Logic
+-- Safety Car / Penalty Logic
+local scPos = 0
+local scSpeed = 80 / 3.6
+local trackLength = ac.getSim().trackLengthM
 local overtakeTimer = 0
 local penaltyIssued = false
 
@@ -24,7 +26,6 @@ local function safe(fn)
     end
 end
 
--- Расчет текущего порядка
 local function getRaceOrder()
     local order = {}
     for i = 0, ac.getSim().carsCount - 1 do
@@ -44,22 +45,38 @@ end
 
 function script.update(dt)
     if messageTimer > 0 then messageTimer = messageTimer - dt end
+    if yellowCooldown > 0 then yellowCooldown = yellowCooldown - dt end
     
+    -- АВТО-ДЕТЕКТОР (только если сейчас GREEN)
+    if currentFlag == STATE.GREEN and yellowCooldown <= 0 then
+        for i = 0, ac.getSim().carsCount - 1 do
+            local car = ac.getCar(i)
+            -- Если машина на трассе, подключена и едет медленно
+            if car.isConnected and not car.isInPitlane and car.speedKmh < 40 and car.speedKmh > 2 then
+                slowTimers[i] = (slowTimers[i] or 0) + dt
+                if slowTimers[i] > 3.0 then
+                    ac.sendChatMessage("CAUTION: Slow car detected (" .. car.driverName .. ") !yellow")
+                    yellowCooldown = 30 -- Не срабатывать повторно 30 секунд
+                    break
+                end
+            else
+                slowTimers[i] = 0
+            end
+        end
+    end
+
+    -- Логика коушна
     if currentFlag ~= STATE.GREEN then
-        -- Двигаем виртуальный сейфти-кар
         scPos = (scPos + (scSpeed * dt) / trackLength) % 1
         
-        -- Логика штрафов (только если есть цель)
         if targetCarID ~= -1 then
             local me = ac.getCar(0)
             local target = ac.getCar(targetCarID)
-            
-            -- Если мы впереди цели (учитываем переход через 0/1 сплайна)
             local distDiff = me.splinePosition - target.splinePosition
             if distDiff < -0.5 then distDiff = distDiff + 1 end
             if distDiff > 0.5 then distDiff = distDiff - 1 end
             
-            if distDiff > 0.005 then -- Обогнали более чем на 5 метров
+            if distDiff > 0.005 then
                 overtakeTimer = overtakeTimer + dt
                 if overtakeTimer > 2.0 and not penaltyIssued then
                     ac.sendChatMessage("PENALTY: " .. me.driverName .. " ILLEGAL OVERTAKE!")
@@ -81,7 +98,6 @@ ac.onChatMessage(safe(function(msg, senderID)
         messageTimer = 5
         penaltyIssued = false
         
-        -- Находим цель
         local order = getRaceOrder()
         for i, entry in ipairs(order) do
             if entry.id == 0 then
@@ -91,8 +107,7 @@ ac.onChatMessage(safe(function(msg, senderID)
                 else 
                     targetCarID = -1
                     targetCarName = "SAFETY CAR"
-                    -- Лидер привязывается к сейфти-кару
-                    scPos = entry.spline + 0.02 -- Сейфти-кар в 2% трассы перед лидером
+                    scPos = entry.spline + 0.02
                 end
                 break
             end
@@ -107,33 +122,25 @@ end))
 
 function script.drawUI()
     local centerX = ui.windowSize().x / 2
-    
-    -- 1. Flag HUD
     if currentFlag ~= STATE.GREEN then
         local color = currentFlag == STATE.CAUTION and rgbm(1, 1, 0, 1) or rgbm(1, 0.5, 0, 1)
         ui.drawRectFilled(vec2(centerX - 160, 40), vec2(centerX + 160, 110), color, 5)
-        
         ui.setCursor(vec2(centerX - 110, 55))
         ui.pushFont(ui.Font.Title)
         ui.textColored(" YELLOW FLAG", rgbm(0, 0, 0, 1))
         ui.popFont()
-        
         ui.setCursor(vec2(centerX - 140, 90))
         ui.textColored("FOLLOW: " .. targetCarName, rgbm(0, 0, 0, 1))
         
-        -- Штрафное предупреждение
         if overtakeTimer > 0 then
             ui.setCursor(vec2(centerX - 120, 120))
             ui.textColored("!!! GIVE BACK POSITION !!!", rgbm(1, 0, 0, 1))
-            ui.drawRectFilled(vec2(centerX - 130, 115), vec2(centerX + 130, 145), rgbm(0, 0, 0, 0.5), 3)
         end
     end
     
-    -- 2. 3D Маркер Сейфти-кара (только для лидера или если близко)
     if currentFlag ~= STATE.GREEN and targetCarName == "SAFETY CAR" then
         local scWorldPos = ac.getTrackFullSpline():posAt(scPos)
         local screenPos = ac.worldToScreen(scWorldPos)
-        
         if screenPos.z > 0 then
             ui.setCursor(vec2(screenPos.x - 50, screenPos.y - 100))
             ui.drawRectFilled(vec2(screenPos.x - 60, screenPos.y - 110), vec2(screenPos.x + 60, screenPos.y - 70), rgbm(1, 0.8, 0, 0.8), 10)
