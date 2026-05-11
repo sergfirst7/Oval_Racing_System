@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System v3.0 (STABLE ROLLING START)
--- Fixed SC Logic | Symmetrical UI | Race Only
+-- DRS World: Oval Racing System v3.1 (DEBUG EDITION)
+-- Robust Session Check | Forced UI on !yellow
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3, STARTING = 4 }
 local currentFlag = STATE.STARTING
@@ -14,24 +14,31 @@ local cautionStartLap = 0
 local overtakeTimer = 0
 local penaltyAppliedTimer = 0
 local sessionStartTimer = 0
-local initializedSC = false -- Флаг разовой инициализации Сейфтикара
+local initializedSC = false
+local forceUI = false -- Принудительный показ UI
 
 -- Track info
 local trackLength = ac.getSim().trackLengthM
 local scPos = 0 
 local scSpeed = 120 / 3.6
 
--- ЖЕСТКАЯ ПРОВЕРКА СЕССИИ (Только Race)
+-- УЛУЧШЕННАЯ ПРОВЕРКА СЕССИИ
 local function isRaceSession()
+    if forceUI then return true end
     local sim = ac.getSim()
     if not sim then return false end
+    
     local isRace = false
+    -- Способ 1: По типу (2 = Race)
+    pcall(function() if sim.sessionType == 2 then isRace = true end end)
+    
+    -- Способ 2: По имени
     pcall(function() 
-        -- Проверка типа (2 = Race) или имени
-        if sim.sessionType == 2 or string.find(sim.sessionName, "Race") then
-            isRace = true
-        end
+        if sim.sessionName and string.find(sim.sessionName:lower(), "race") then 
+            isRace = true 
+        end 
     end)
+    
     return isRace
 end
 
@@ -63,7 +70,6 @@ local function getSideText(id)
     return ""
 end
 
--- Инициализация цели (Вызывается ТОЛЬКО при смене состояния)
 local function initTarget()
     local order = {}
     for i = 0, ac.getSim().carsCount - 1 do
@@ -82,7 +88,6 @@ local function initTarget()
                 targetCarID = order[i-1].id
                 targetCarName = order[i-1].name
             else 
-                -- Мы лидеры, инициализируем SC перед собой
                 scPos = (entry.spline + 80/trackLength) % 1
             end
             break
@@ -108,13 +113,11 @@ function script.update(dt)
     
     local me = ac.getCar(0)
 
-    -- Разовая инициализация при самом первом запуске сессии
     if not initializedSC then
         initTarget()
         initializedSC = true
     end
 
-    -- Детектор аварий
     if currentFlag == STATE.GREEN and yellowCooldown <= 0 and sessionStartTimer > 40 then
         for i = 0, ac.getSim().carsCount - 1 do
             local car = ac.getCar(i)
@@ -132,11 +135,8 @@ function script.update(dt)
         end
     end
 
-    -- Логика движения под флагом
     if currentFlag ~= STATE.GREEN then
-        -- Виртуальный SC движется независимо
         scPos = (scPos + (scSpeed * dt) / trackLength) % 1
-        
         local distToTarget = 0
         if targetCarID == -1 then
             distToTarget = (scPos - me.splinePosition) * trackLength
@@ -146,7 +146,6 @@ function script.update(dt)
         end
         if distToTarget < -trackLength/2 then distToTarget = distToTarget + trackLength end
 
-        -- Штраф за обгон (лимит 3 метра, задержка 1 сек)
         if distToTarget < -3 then
             overtakeTimer = overtakeTimer + dt
             if overtakeTimer > 1.0 then
@@ -157,7 +156,6 @@ function script.update(dt)
             overtakeTimer = math.max(0, overtakeTimer - dt)
         end
 
-        -- Авто-рестарт
         if currentFlag ~= STATE.STARTING then
             local lapsPassed = me.lapCount - cautionStartLap
             if lapsPassed >= 2 then
@@ -174,7 +172,9 @@ end
 
 ac.onChatMessage(function(msg, senderID)
     local text = msg:lower()
-    if string.find(text, "!yellow") then triggerCaution()
+    if string.find(text, "!yellow") then 
+        forceUI = true
+        triggerCaution()
     elseif string.find(text, "!green") then 
         currentFlag = STATE.GREEN 
         restartTimer = 5.0
@@ -189,7 +189,7 @@ function script.drawUI()
     
     if showBlock then
         local boxW = 380
-        local boxH = 142 -- Уменьшено для симметрии
+        local boxH = 142
         local bgColor = currentFlag == STATE.GREEN and rgbm(0, 0.8, 0, 1) or rgbm(1, 1, 0, 1)
         
         ui.drawRectFilled(vec2(centerX - boxW/2, 40), vec2(centerX + boxW/2, 40 + boxH), bgColor, 12)
@@ -238,6 +238,9 @@ function script.drawUI()
         ui.popFont()
     end
     
+    -- Debug Info
     ui.setCursor(vec2(10, 10))
-    ui.text("DRS Oval v3.0 STABLE")
+    local sType = -1
+    pcall(function() sType = ac.getSim().sessionType end)
+    ui.text("v3.1 | Type: " .. sType .. " | Race: " .. tostring(isRaceSession()))
 end
