@@ -1,8 +1,8 @@
--- DRS World: Oval Racing System v4.1 (SAFETY CAR FOCUS)
--- Rolling Start DISABLED | Stable Caution & Reset
+-- DRS World: Oval Racing System v4.2 (TIMER FIX)
+-- Green HUD disappears after 2s | Guaranteed timer logic
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
-local currentFlag = STATE.GREEN -- Всегда начинаем с Зеленого
+local currentFlag = STATE.GREEN
 local lastSessionIndex = -1
 local targetCarID = -1
 local targetCarName = "NONE"
@@ -15,7 +15,6 @@ local cautionStartLap = 0
 local overtakeTimer = 0
 local penaltyAppliedTimer = 0
 local sessionStartTimer = 0
-local initializedSC = false
 local forceUI = false
 
 -- Track info
@@ -23,14 +22,6 @@ local sim = ac.getSim()
 local trackLength = sim and sim.trackLengthM or 1000
 local scPos = 0 
 local scSpeed = 120 / 3.6
-
-local function isRaceSession()
-    if forceUI then return true end
-    local s = ac.getSim()
-    if not s then return false end
-    -- Разрешаем во всех сессиях для тестов, кроме практики если нужно
-    return true
-end
 
 local function safeName(id)
     local name = ac.getDriverName(id)
@@ -86,30 +77,27 @@ local function initTarget()
 end
 
 function script.update(dt)
+    -- ГАРАНТИРОВАННОЕ УМЕНЬШЕНИЕ ТАЙМЕРА
+    if restartTimer > 0 then restartTimer = restartTimer - dt end
+    if penaltyAppliedTimer > 0 then penaltyAppliedTimer = penaltyAppliedTimer - dt end
+    if yellowCooldown > 0 then yellowCooldown = yellowCooldown - dt end
+
     pcall(function()
         local s = ac.getSim()
         if not s then return end
 
-        -- Сброс при смене сессии
         if s.sessionIndex ~= lastSessionIndex then
             lastSessionIndex = s.sessionIndex
             currentFlag = STATE.GREEN
             sessionStartTimer = 0
-            yellowCooldown = 30
-            restartTimer = 0
+            restartTimer = 0 -- Сброс при смене сессии
         end
 
-        if not isRaceSession() then return end
-
         sessionStartTimer = sessionStartTimer + dt
-        if restartTimer > 0 then restartTimer = restartTimer - dt end
-        if yellowCooldown > 0 then yellowCooldown = yellowCooldown - dt end
-        if penaltyAppliedTimer > 0 then penaltyAppliedTimer = penaltyAppliedTimer - dt end
-        
         local me = ac.getCar(0)
         if not me then return end
 
-        -- Авто-Желтый (только в гонке)
+        -- Авто-Желтый
         if currentFlag == STATE.GREEN and yellowCooldown <= 0 and sessionStartTimer > 10 then
             for i = 0, ac.getSim().carsCount - 1 do
                 local car = ac.getCar(i)
@@ -129,7 +117,6 @@ function script.update(dt)
             end
         end
 
-        -- Логика следования за целью при Желтом флаге
         if currentFlag ~= STATE.GREEN then
             scPos = (scPos + (scSpeed * dt) / trackLength) % 1
             local distToTarget = 0
@@ -137,13 +124,10 @@ function script.update(dt)
                 distToTarget = (scPos - me.splinePosition) * trackLength
             else
                 local tCar = ac.getCar(targetCarID)
-                if tCar then
-                    distToTarget = (tCar.splinePosition - me.splinePosition) * trackLength
-                end
+                if tCar then distToTarget = (tCar.splinePosition - me.splinePosition) * trackLength end
             end
             if distToTarget < -trackLength/2 then distToTarget = distToTarget + trackLength end
 
-            -- Проверка обгона под желтым
             if distToTarget < -3 and sessionStartTimer > 5 then
                 overtakeTimer = overtakeTimer + dt
                 if overtakeTimer > 1.5 then
@@ -154,16 +138,14 @@ function script.update(dt)
                 overtakeTimer = math.max(0, overtakeTimer - dt)
             end
 
-            -- Авто-выход из желтого через 2 круга
-            if currentFlag == STATE.CAUTION or currentFlag == STATE.ONE_TO_GREEN then
-                local lapsPassed = me.lapCount - cautionStartLap
-                if lapsPassed >= 2 then
-                    currentFlag = STATE.GREEN
-                    targetCarID = -1
-                    restartTimer = 5.0
-                elseif lapsPassed >= 1.5 then
-                    currentFlag = STATE.ONE_TO_GREEN
-                end
+            -- Авто-выход
+            local lapsPassed = me.lapCount - cautionStartLap
+            if lapsPassed >= 2 then
+                currentFlag = STATE.GREEN
+                targetCarID = -1
+                restartTimer = 2.0 -- 2 секунды на исчезновение
+            elseif lapsPassed >= 1.5 then
+                currentFlag = STATE.ONE_TO_GREEN
             end
         end
     end)
@@ -178,14 +160,12 @@ ac.onChatMessage(function(msg, senderID)
         initTarget()
     elseif string.find(text, "!green") then 
         currentFlag = STATE.GREEN 
-        restartTimer = 5.0
+        restartTimer = 2.0 -- 2 СЕКУНДЫ
     end
 end)
 
 function script.drawUI()
     pcall(function()
-        if not isRaceSession() then return end
-
         local centerX = ui.windowSize().x / 2
         local showBlock = (currentFlag ~= STATE.GREEN) or (restartTimer > 0)
         
