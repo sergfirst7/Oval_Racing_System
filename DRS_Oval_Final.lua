@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System v3.6 (FINAL CACHE KILLER)
--- Dynamic UI | Auto Rolling Start
+-- DRS World: Oval Racing System v3.7 (UI REBORN)
+-- Narrow Box | Fixed Overlap | Robust Rolling Start
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3, STARTING = 4 }
 local currentFlag = STATE.STARTING
@@ -96,6 +96,11 @@ function script.update(dt)
         local me = ac.getCar(0)
         if not me then return end
 
+        -- ЖЕСТКАЯ ПРОВЕРКА РОЛЛИНГ СТАРТА
+        if me.lapCount == 0 and me.splinePosition < 0.5 and currentFlag == STATE.GREEN then
+            currentFlag = STATE.STARTING
+        end
+
         if not initializedSC then
             initTarget()
             initializedSC = true
@@ -141,7 +146,7 @@ function script.update(dt)
 
             if distToTarget < -3 and sessionStartTimer > 10 then
                 overtakeTimer = overtakeTimer + dt
-                if overtakeTimer > 1.2 then
+                if overtakeTimer > 1.5 then
                     applyRealPenalty(0, 10)
                     overtakeTimer = -10
                 end
@@ -184,11 +189,12 @@ function script.drawUI()
         local showBlock = (currentFlag ~= STATE.GREEN) or (restartTimer > 0)
         
         if showBlock then
-            local boxW = 380
-            local boxH = (currentFlag == STATE.GREEN) and 60 or 142 -- Короткий для зеленого
+            local boxW = 320 -- УЖЕ
+            local boxH = (currentFlag == STATE.GREEN) and 60 or 130 -- ОПТИМАЛЬНО
             local bgColor = (currentFlag == STATE.GREEN) and rgbm(0, 0.8, 0, 1) or rgbm(1, 1, 0, 1)
+            local boxY = 40
             
-            ui.drawRectFilled(vec2(centerX - boxW/2, 40), vec2(centerX + boxW/2, 40 + boxH), bgColor, 12)
+            ui.drawRectFilled(vec2(centerX - boxW/2, boxY), vec2(centerX + boxW/2, boxY + boxH), bgColor, 12)
             
             local title = "YELLOW FLAG"
             if currentFlag == STATE.GREEN then title = "GREEN FLAG / GO!" 
@@ -197,24 +203,25 @@ function script.drawUI()
             
             ui.pushFont(ui.Font.Title)
             local titleSize = ui.measureText(title)
-            -- Центрирование текста по высоте
-            local titleY = 40 + (boxH / 2) - (titleSize.y / 2)
-            ui.setCursor(vec2(centerX - titleSize.x/2, titleY))
+            -- Заголовок всегда сверху
+            ui.setCursor(vec2(centerX - titleSize.x/2, boxY + 10))
             ui.textColored(title, rgbm(0, 0, 0, 1))
             ui.popFont()
             
             if currentFlag ~= STATE.GREEN then
-                -- Смещение дополнительных данных вниз
+                -- Строка 2: FOLLOW
                 local followText = "FOLLOW: " .. targetCarName
                 local followSize = ui.measureText(followText)
-                ui.setCursor(vec2(centerX - followSize.x/2, 85))
+                ui.setCursor(vec2(centerX - followSize.x/2, boxY + 45))
                 ui.textColored(followText, rgbm(0, 0, 0, 1))
                 
+                -- Строка 3: SIDE (Синим)
                 local sideText = getSideText(0)
                 local sideSize = ui.measureText(sideText)
-                ui.setCursor(vec2(centerX - sideSize.x/2, 105))
+                ui.setCursor(vec2(centerX - sideSize.x/2, boxY + 65))
                 ui.textColored(sideText, rgbm(0, 0.2, 0.8, 1))
                 
+                -- Строка 4: DISTANCE (Крупно)
                 local me = ac.getCar(0)
                 local dist = targetCarID == -1 and (scPos - me.splinePosition) * trackLength or (ac.getCar(targetCarID).splinePosition - me.splinePosition) * trackLength
                 if dist < -trackLength/2 then dist = dist + trackLength end
@@ -222,7 +229,7 @@ function script.drawUI()
                 ui.pushFont(ui.Font.Title)
                 local dText = math.floor(dist) .. "m"
                 local dSize = ui.measureText(dText)
-                ui.setCursor(vec2(centerX - dSize.x/2, 122))
+                ui.setCursor(vec2(centerX - dSize.x/2, boxY + 85))
                 ui.textColored(dText, (dist < 10 or dist > 50) and rgbm(1, 0, 0, 1) or rgbm(0, 0, 0, 1))
                 ui.popFont()
             end
@@ -238,6 +245,6 @@ function script.drawUI()
         
         ui.setCursor(vec2(10, 10))
         local s = ac.getSim()
-        ui.text("v3.6 FINAL | Session: " .. (s.sessionName or "N/A") .. " | Type: " .. s.sessionType)
+        ui.text("v3.7 | Session: " .. (s.sessionName or "N/A") .. " | Type: " .. s.sessionType)
     end)
 end
