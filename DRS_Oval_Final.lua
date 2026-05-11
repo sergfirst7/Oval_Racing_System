@@ -1,8 +1,9 @@
--- DRS World: Oval Racing System v3.7 (UI REBORN)
--- Narrow Box | Fixed Overlap | Robust Rolling Start
+-- DRS World: Oval Racing System v3.8 (SMART LOGIC)
+-- Fixed !green loop | Version inside HUD | Stable Auto-Start
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3, STARTING = 4 }
 local currentFlag = STATE.STARTING
+local rollingStartDone = false
 local targetCarID = -1
 local targetCarName = "NONE"
 local restartTimer = 0
@@ -96,23 +97,26 @@ function script.update(dt)
         local me = ac.getCar(0)
         if not me then return end
 
-        -- ЖЕСТКАЯ ПРОВЕРКА РОЛЛИНГ СТАРТА
-        if me.lapCount == 0 and me.splinePosition < 0.5 and currentFlag == STATE.GREEN then
-            currentFlag = STATE.STARTING
-        end
-
+        -- ИНИЦИАЛИЗАЦИЯ СТАРТА
         if not initializedSC then
             initTarget()
+            if me.lapCount == 0 and me.splinePosition < 0.5 then
+                currentFlag = STATE.STARTING
+                rollingStartDone = false
+            end
             initializedSC = true
         end
 
+        -- АВТО-ЗЕЛЕНЫЙ
         if currentFlag == STATE.STARTING and me.splinePosition > 0.5 then
             currentFlag = STATE.GREEN
+            rollingStartDone = true
             ac.sendChatMessage("GREEN FLAG! GO! !green")
             restartTimer = 5.0
         end
 
-        if currentFlag == STATE.GREEN and yellowCooldown <= 0 and sessionStartTimer > 60 then
+        -- АВТО-ЖЕЛТЫЙ (только после старта)
+        if currentFlag == STATE.GREEN and rollingStartDone and yellowCooldown <= 0 and sessionStartTimer > 60 then
             for i = 0, ac.getSim().carsCount - 1 do
                 local car = ac.getCar(i)
                 if car and car.isConnected and not car.isInPitlane and car.speedKmh < 40 then
@@ -177,6 +181,7 @@ ac.onChatMessage(function(msg, senderID)
         initTarget()
     elseif string.find(text, "!green") then 
         currentFlag = STATE.GREEN 
+        rollingStartDone = true -- ЗАПРЕЩАЕМ ВОЗВРАТ К СТАРТУ
         restartTimer = 5.0
     end
 end)
@@ -189,8 +194,8 @@ function script.drawUI()
         local showBlock = (currentFlag ~= STATE.GREEN) or (restartTimer > 0)
         
         if showBlock then
-            local boxW = 320 -- УЖЕ
-            local boxH = (currentFlag == STATE.GREEN) and 60 or 130 -- ОПТИМАЛЬНО
+            local boxW = 320
+            local boxH = (currentFlag == STATE.GREEN) and 70 or 145 -- Чуть выше для версии
             local bgColor = (currentFlag == STATE.GREEN) and rgbm(0, 0.8, 0, 1) or rgbm(1, 1, 0, 1)
             local boxY = 40
             
@@ -203,36 +208,32 @@ function script.drawUI()
             
             ui.pushFont(ui.Font.Title)
             local titleSize = ui.measureText(title)
-            -- Заголовок всегда сверху
             ui.setCursor(vec2(centerX - titleSize.x/2, boxY + 10))
             ui.textColored(title, rgbm(0, 0, 0, 1))
             ui.popFont()
             
             if currentFlag ~= STATE.GREEN then
-                -- Строка 2: FOLLOW
-                local followText = "FOLLOW: " .. targetCarName
-                local followSize = ui.measureText(followText)
-                ui.setCursor(vec2(centerX - followSize.x/2, boxY + 45))
-                ui.textColored(followText, rgbm(0, 0, 0, 1))
+                ui.setCursor(vec2(centerX - ui.measureText("FOLLOW: " .. targetCarName).x/2, boxY + 45))
+                ui.textColored("FOLLOW: " .. targetCarName, rgbm(0, 0, 0, 1))
                 
-                -- Строка 3: SIDE (Синим)
-                local sideText = getSideText(0)
-                local sideSize = ui.measureText(sideText)
-                ui.setCursor(vec2(centerX - sideSize.x/2, boxY + 65))
-                ui.textColored(sideText, rgbm(0, 0.2, 0.8, 1))
+                local side = getSideText(0)
+                ui.setCursor(vec2(centerX - ui.measureText(side).x/2, boxY + 65))
+                ui.textColored(side, rgbm(0, 0.2, 0.8, 1))
                 
-                -- Строка 4: DISTANCE (Крупно)
                 local me = ac.getCar(0)
                 local dist = targetCarID == -1 and (scPos - me.splinePosition) * trackLength or (ac.getCar(targetCarID).splinePosition - me.splinePosition) * trackLength
                 if dist < -trackLength/2 then dist = dist + trackLength end
 
                 ui.pushFont(ui.Font.Title)
                 local dText = math.floor(dist) .. "m"
-                local dSize = ui.measureText(dText)
-                ui.setCursor(vec2(centerX - dSize.x/2, boxY + 85))
+                ui.setCursor(vec2(centerX - ui.measureText(dText).x/2, boxY + 85))
                 ui.textColored(dText, (dist < 10 or dist > 50) and rgbm(1, 0, 0, 1) or rgbm(0, 0, 0, 1))
                 ui.popFont()
             end
+
+            -- ВЕРСИЯ ВНУТРИ БОКСА
+            ui.setCursor(vec2(centerX - 25, boxY + boxH - 15))
+            ui.textColored("v3.8", rgbm(0, 0, 0, 0.5))
         end
 
         if penaltyAppliedTimer > 0 then
@@ -242,9 +243,5 @@ function script.drawUI()
             ui.textColored("REAL PENALTY APPLIED: +10s", rgbm(1, 1, 1, 1))
             ui.popFont()
         end
-        
-        ui.setCursor(vec2(10, 10))
-        local s = ac.getSim()
-        ui.text("v3.7 | Session: " .. (s.sessionName or "N/A") .. " | Type: " .. s.sessionType)
     end)
 end
