@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System v2.4 (REAL PENALTIES)
--- Race Only + Rolling Start + Real Server Penalties
+-- DRS World: Oval Racing System v2.5 (CRASH FIX)
+-- Fixed 'sessionType' error + Real Penalties
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
@@ -12,7 +12,7 @@ local yellowCooldown = 0
 local slowTimers = {}
 local cautionStartLap = 0
 local overtakeTimer = 0
-local penaltyAppliedTimer = 0 -- Для уведомления на экране
+local penaltyAppliedTimer = 0
 
 -- Track info
 local trackLength = ac.getSim().trackLengthM
@@ -24,10 +24,9 @@ local function safeName(id)
     return (name and name ~= "") and name or "Driver #"..id
 end
 
--- Применение реального штрафа через серверную команду
 local function applyRealPenalty(id, seconds)
     ac.sendChatMessage("!penalty #" .. id .. " " .. seconds)
-    penaltyAppliedTimer = 5.0 -- Показываем уведомление на экране 5 секунд
+    penaltyAppliedTimer = 5.0
 end
 
 local function getSideText(id)
@@ -50,7 +49,8 @@ local function getSideText(id)
 end
 
 local function triggerCaution()
-    if ac.getSim().sessionType ~= ac.SessionType.Race then return end
+    -- Безопасная проверка сессии
+    if not string.find(ac.getSim().sessionName, "Race") then return end
     if currentFlag ~= STATE.GREEN then return end
     
     currentFlag = STATE.CAUTION
@@ -82,8 +82,7 @@ local function triggerCaution()
 end
 
 function script.update(dt)
-    local sim = ac.getSim()
-    if sim.sessionType ~= ac.SessionType.Race then return end
+    if not string.find(ac.getSim().sessionName, "Race") then return end
 
     if restartTimer > 0 then restartTimer = restartTimer - dt end
     if yellowCooldown > 0 then yellowCooldown = yellowCooldown - dt end
@@ -91,9 +90,8 @@ function script.update(dt)
     
     local me = ac.getCar(0)
     
-    -- Детектор аварий
     if currentFlag == STATE.GREEN and yellowCooldown <= 0 then
-        for i = 0, sim.carsCount - 1 do
+        for i = 0, ac.getSim().carsCount - 1 do
             local car = ac.getCar(i)
             if car and car.isConnected and not car.isInPitlane and car.speedKmh < 40 then
                 slowTimers[i] = (slowTimers[i] or 0) + dt
@@ -109,7 +107,6 @@ function script.update(dt)
         end
     end
 
-    -- Судейство под желтым флагом
     if currentFlag ~= STATE.GREEN then
         scPos = (scPos + (scSpeed * dt) / trackLength) % 1
         
@@ -125,7 +122,7 @@ function script.update(dt)
         if distToTarget < -2 then
             overtakeTimer = overtakeTimer + dt
             if overtakeTimer > 3.0 then
-                applyRealPenalty(0, 10) -- РЕАЛЬНЫЙ ШТРАФ
+                applyRealPenalty(0, 10)
                 overtakeTimer = -10
             end
         else
@@ -154,8 +151,8 @@ ac.onChatMessage(function(msg, senderID)
 end)
 
 function script.drawUI()
-    local sim = ac.getSim()
-    if sim.sessionType ~= ac.SessionType.Race then return end
+    -- Безопасная проверка
+    if not string.find(ac.getSim().sessionName, "Race") then return end
 
     local centerX = ui.windowSize().x / 2
     local showBlock = (currentFlag ~= STATE.GREEN) or (restartTimer > 0)
@@ -202,7 +199,6 @@ function script.drawUI()
         end
     end
 
-    -- Уведомление о примененном штрафе
     if penaltyAppliedTimer > 0 then
         ui.drawRectFilled(vec2(centerX - 250, 200), vec2(centerX + 250, 250), rgbm(1, 0, 0, 0.95), 8)
         ui.setCursor(vec2(centerX - 230, 210))
@@ -212,5 +208,5 @@ function script.drawUI()
     end
     
     ui.setCursor(vec2(10, 10))
-    ui.text("DRS Oval v2.4 REAL-TIME")
+    ui.text("DRS Oval v2.5")
 end
