@@ -1,4 +1,4 @@
--- DRS World: Oval Racing System v2.5 (CRASH FIX)
+-- DRS World: Oval Racing System v2.6 (CACHE BUSTER)
 -- Fixed 'sessionType' error + Real Penalties
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
@@ -50,7 +50,8 @@ end
 
 local function triggerCaution()
     -- Безопасная проверка сессии
-    if not string.find(ac.getSim().sessionName, "Race") then return end
+    local sim = ac.getSim()
+    if not string.find(sim.sessionName, "Race") then return end
     if currentFlag ~= STATE.GREEN then return end
     
     currentFlag = STATE.CAUTION
@@ -82,7 +83,8 @@ local function triggerCaution()
 end
 
 function script.update(dt)
-    if not string.find(ac.getSim().sessionName, "Race") then return end
+    local sim = ac.getSim()
+    if not string.find(sim.sessionName, "Race") then return end
 
     if restartTimer > 0 then restartTimer = restartTimer - dt end
     if yellowCooldown > 0 then yellowCooldown = yellowCooldown - dt end
@@ -151,8 +153,9 @@ ac.onChatMessage(function(msg, senderID)
 end)
 
 function script.drawUI()
-    -- Безопасная проверка
-    if not string.find(ac.getSim().sessionName, "Race") then return end
+    local sim = ac.getSim()
+    -- Безопасная проверка через sessionName
+    if not string.find(sim.sessionName, "Race") then return end
 
     local centerX = ui.windowSize().x / 2
     local showBlock = (currentFlag ~= STATE.GREEN) or (restartTimer > 0)
@@ -208,5 +211,5 @@ function script.drawUI()
     end
     
     ui.setCursor(vec2(10, 10))
-    ui.text("DRS Oval v2.5")
+    ui.text("DRS Oval v2.6")
 end
