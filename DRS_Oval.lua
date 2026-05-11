@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System v2.6 (CACHE BUSTER)
--- Fixed 'sessionType' error + Real Penalties
+-- DRS World: Oval Racing System v2.7 (ULTRA COMPATIBILITY)
+-- Protected Session Check + Real Penalties
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
@@ -18,6 +18,21 @@ local penaltyAppliedTimer = 0
 local trackLength = ac.getSim().trackLengthM
 local scPos = 0 
 local scSpeed = 80 / 3.6
+
+-- БЕЗОПАСНАЯ ПРОВЕРКА СЕССИИ (Для серверных скриптов)
+local function isRaceSession()
+    local sim = ac.getSim()
+    if not sim then return true end
+    
+    -- Пробуем разные способы
+    local ok, res = pcall(function() return string.find(sim.sessionName, "Race") ~= nil end)
+    if ok then return res end
+    
+    local ok2, res2 = pcall(function() return sim.sessionType == 2 end)
+    if ok2 then return res2 end
+
+    return true -- Если не удалось определить, разрешаем работу
+end
 
 local function safeName(id)
     local name = ac.getDriverName(id)
@@ -49,9 +64,7 @@ local function getSideText(id)
 end
 
 local function triggerCaution()
-    -- Безопасная проверка сессии
-    local sim = ac.getSim()
-    if not string.find(sim.sessionName, "Race") then return end
+    if not isRaceSession() then return end
     if currentFlag ~= STATE.GREEN then return end
     
     currentFlag = STATE.CAUTION
@@ -83,8 +96,7 @@ local function triggerCaution()
 end
 
 function script.update(dt)
-    local sim = ac.getSim()
-    if not string.find(sim.sessionName, "Race") then return end
+    if not isRaceSession() then return end
 
     if restartTimer > 0 then restartTimer = restartTimer - dt end
     if yellowCooldown > 0 then yellowCooldown = yellowCooldown - dt end
@@ -153,9 +165,7 @@ ac.onChatMessage(function(msg, senderID)
 end)
 
 function script.drawUI()
-    local sim = ac.getSim()
-    -- Безопасная проверка через sessionName
-    if not string.find(sim.sessionName, "Race") then return end
+    if not isRaceSession() then return end
 
     local centerX = ui.windowSize().x / 2
     local showBlock = (currentFlag ~= STATE.GREEN) or (restartTimer > 0)
@@ -211,5 +221,5 @@ function script.drawUI()
     end
     
     ui.setCursor(vec2(10, 10))
-    ui.text("DRS Oval v2.6")
+    ui.text("DRS Oval v2.7 PROTECTED")
 end
