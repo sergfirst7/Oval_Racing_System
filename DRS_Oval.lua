@@ -1,11 +1,11 @@
--- DRS World: Oval Racing System v2.0 (ULTIMATE UI)
--- Large Fonts + Green Start Block + Perfect Centering
+-- DRS World: Oval Racing System v2.1 (FINAL CLEAN)
+-- Fixed caching + Large Fonts + Removed ghost text
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
 local targetCarID = -1
 local targetCarName = "NONE"
-local messageTimer = 0
+local restartTimer = 0 -- Таймер для зеленого блока
 
 -- Caution Tracking
 local yellowCooldown = 0
@@ -26,7 +26,7 @@ end
 local function triggerCaution()
     if currentFlag ~= STATE.GREEN then return end
     currentFlag = STATE.CAUTION
-    messageTimer = 0 -- Сбрасываем таймер сообщений
+    restartTimer = 0
     cautionStartLap = ac.getCar(0).lapCount
     
     local order = {}
@@ -54,7 +54,7 @@ local function triggerCaution()
 end
 
 function script.update(dt)
-    if messageTimer > 0 then messageTimer = messageTimer - dt end
+    if restartTimer > 0 then restartTimer = restartTimer - dt end
     if yellowCooldown > 0 then yellowCooldown = yellowCooldown - dt end
     
     local me = ac.getCar(0)
@@ -85,11 +85,10 @@ function script.update(dt)
         if lapsPassed >= 2 then
             currentFlag = STATE.GREEN
             targetCarID = -1
-            messageTimer = 5.0 -- Блок будет зеленым 5 секунд
+            restartTimer = 5.0
             ac.sendChatMessage("GREEN FLAG! GO! !green")
         elseif lapsPassed >= 1.5 and currentFlag == STATE.CAUTION then
             currentFlag = STATE.ONE_TO_GREEN
-            ac.sendChatMessage("ONE TO GREEN - PREPARE!")
         end
 
         -- Овертейк
@@ -114,22 +113,22 @@ ac.onChatMessage(function(msg, senderID)
     if string.find(text, "!yellow") then triggerCaution()
     elseif string.find(text, "!green") then 
         currentFlag = STATE.GREEN 
-        messageTimer = 5.0
+        restartTimer = 5.0
     end
 end)
 
 function script.drawUI()
     local centerX = ui.windowSize().x / 2
-    local showBlock = (currentFlag ~= STATE.GREEN) or (currentFlag == STATE.GREEN and messageTimer > 0)
+    local showBlock = (currentFlag ~= STATE.GREEN) or (restartTimer > 0)
     
     if showBlock then
         local boxW = 450
-        local boxH = 140
+        local boxH = 160
         local bgColor = currentFlag == STATE.GREEN and rgbm(0, 0.8, 0, 1) or rgbm(1, 1, 0, 1)
         
         ui.drawRectFilled(vec2(centerX - boxW/2, 40), vec2(centerX + boxW/2, 40 + boxH), bgColor, 15)
         
-        -- Крупный заголовок
+        -- ЗАГОЛОВОК (Крупный)
         local title = "YELLOW FLAG"
         if currentFlag == STATE.GREEN then title = "GREEN FLAG / GO!" 
         elseif currentFlag == STATE.ONE_TO_GREEN then title = "ONE TO GREEN" end
@@ -140,11 +139,11 @@ function script.drawUI()
         ui.textColored(title, rgbm(0, 0, 0, 1))
         ui.popFont()
         
-        -- Доп инфо (только при желтом)
+        -- ИНФО (Только если не зеленый старт)
         if currentFlag ~= STATE.GREEN then
             local followText = "FOLLOW: " .. targetCarName
             local followSize = ui.measureText(followText)
-            ui.setCursor(vec2(centerX - followSize.x/2, 90))
+            ui.setCursor(vec2(centerX - followSize.x/2, 95))
             ui.textColored(followText, rgbm(0, 0, 0, 1))
             
             if targetCarName == "SAFETY CAR" then
@@ -153,16 +152,18 @@ function script.drawUI()
                 if distToSC < -trackLength/2 then distToSC = distToSC + trackLength end
                 
                 local dText = "DISTANCE: " .. math.floor(distToSC) .. "m"
-                local dSize = ui.measureText(dText)
                 local dColor = (distToSC < 15 or distToSC > 60) and rgbm(1, 0, 0, 1) or rgbm(0, 0.5, 0, 1)
                 
-                ui.setCursor(vec2(centerX - dSize.x/2, 110))
+                ui.pushFont(ui.Font.Title)
+                local dSize = ui.measureText(dText)
+                ui.setCursor(vec2(centerX - dSize.x/2, 115))
                 ui.textColored(dText, dColor)
+                ui.popFont()
                 
                 -- Таймер штрафа
                 if scOvertakeTimer > 0 then
-                    ui.drawRectFilled(vec2(centerX - 250, 190), vec2(centerX + 250, 240), rgbm(1, 0, 0, 0.9), 5)
-                    ui.setCursor(vec2(centerX - 230, 200))
+                    ui.drawRectFilled(vec2(centerX - 250, 210), vec2(centerX + 250, 260), rgbm(1, 0, 0, 0.9), 5)
+                    ui.setCursor(vec2(centerX - 230, 210))
                     ui.pushFont(ui.Font.Title)
                     ui.textColored("REDUCE SPEED! PENALTY: " .. string.format("%.1f", 3.0 - scOvertakeTimer) .. "s", rgbm(1, 1, 1, 1))
                     ui.popFont()
@@ -172,5 +173,5 @@ function script.drawUI()
     end
     
     ui.setCursor(vec2(10, 10))
-    ui.text("DRS Oval v2.0 ULTIMATE")
+    ui.text("DRS Oval v2.1")
 end
