@@ -1,11 +1,10 @@
--- DRS World: Oval Racing System v1.9 (FINALE)
--- Perfect UI Centering + Auto-Restart (2 Laps)
+-- DRS World: Oval Racing System v2.0 (ULTIMATE UI)
+-- Large Fonts + Green Start Block + Perfect Centering
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
 local targetCarID = -1
 local targetCarName = "NONE"
-local message = ""
 local messageTimer = 0
 
 -- Caution Tracking
@@ -27,8 +26,7 @@ end
 local function triggerCaution()
     if currentFlag ~= STATE.GREEN then return end
     currentFlag = STATE.CAUTION
-    message = "YELLOW FLAG"
-    messageTimer = 5
+    messageTimer = 0 -- Сбрасываем таймер сообщений
     cautionStartLap = ac.getCar(0).lapCount
     
     local order = {}
@@ -79,16 +77,15 @@ function script.update(dt)
         end
     end
 
-    -- ЛОГИКА РЕСТАРТА (2 круга)
+    -- ЛОГИКА РЕСТАРТА
     if currentFlag ~= STATE.GREEN then
         scPos = (scPos + (scSpeed * dt) / trackLength) % 1
         
         local lapsPassed = me.lapCount - cautionStartLap
-        if lapsPassed >= 2 and currentFlag ~= STATE.GREEN then
+        if lapsPassed >= 2 then
             currentFlag = STATE.GREEN
             targetCarID = -1
-            message = "GREEN FLAG! GO!"
-            messageTimer = 5
+            messageTimer = 5.0 -- Блок будет зеленым 5 секунд
             ac.sendChatMessage("GREEN FLAG! GO! !green")
         elseif lapsPassed >= 1.5 and currentFlag == STATE.CAUTION then
             currentFlag = STATE.ONE_TO_GREEN
@@ -117,60 +114,63 @@ ac.onChatMessage(function(msg, senderID)
     if string.find(text, "!yellow") then triggerCaution()
     elseif string.find(text, "!green") then 
         currentFlag = STATE.GREEN 
-        message = "GREEN FLAG! GO!"
-        messageTimer = 5
+        messageTimer = 5.0
     end
 end)
 
 function script.drawUI()
     local centerX = ui.windowSize().x / 2
+    local showBlock = (currentFlag ~= STATE.GREEN) or (currentFlag == STATE.GREEN and messageTimer > 0)
     
-    if currentFlag ~= STATE.GREEN then
-        local boxW = 400
-        ui.drawRectFilled(vec2(centerX - boxW/2, 40), vec2(centerX + boxW/2, 145), rgbm(1, 1, 0, 1), 12)
+    if showBlock then
+        local boxW = 450
+        local boxH = 140
+        local bgColor = currentFlag == STATE.GREEN and rgbm(0, 0.8, 0, 1) or rgbm(1, 1, 0, 1)
         
-        -- Центрированный заголовок
-        local title = currentFlag == STATE.ONE_TO_GREEN and "ONE TO GREEN" or "YELLOW FLAG"
+        ui.drawRectFilled(vec2(centerX - boxW/2, 40), vec2(centerX + boxW/2, 40 + boxH), bgColor, 15)
+        
+        -- Крупный заголовок
+        local title = "YELLOW FLAG"
+        if currentFlag == STATE.GREEN then title = "GREEN FLAG / GO!" 
+        elseif currentFlag == STATE.ONE_TO_GREEN then title = "ONE TO GREEN" end
+        
+        ui.pushFont(ui.Font.Title)
         local titleSize = ui.measureText(title)
         ui.setCursor(vec2(centerX - titleSize.x/2, 50))
-        ui.pushFont(ui.Font.Main)
         ui.textColored(title, rgbm(0, 0, 0, 1))
         ui.popFont()
         
-        -- Центрированный Follow
-        local followText = "FOLLOW: " .. targetCarName
-        local followSize = ui.measureText(followText)
-        ui.setCursor(vec2(centerX - followSize.x/2, 75))
-        ui.textColored(followText, rgbm(0, 0, 0, 1))
-        
-        -- Дистанция
-        if targetCarName == "SAFETY CAR" then
-            local me = ac.getCar(0)
-            local distToSC = (scPos - me.splinePosition) * trackLength
-            if distToSC < -trackLength/2 then distToSC = distToSC + trackLength end
+        -- Доп инфо (только при желтом)
+        if currentFlag ~= STATE.GREEN then
+            local followText = "FOLLOW: " .. targetCarName
+            local followSize = ui.measureText(followText)
+            ui.setCursor(vec2(centerX - followSize.x/2, 90))
+            ui.textColored(followText, rgbm(0, 0, 0, 1))
             
-            local dText = "DISTANCE: " .. math.floor(distToSC) .. "m"
-            ui.setCursor(vec2(centerX - 100, 105))
-            ui.pushFont(ui.Font.Title)
-            local dColor = (distToSC < 15 or distToSC > 60) and rgbm(1, 0, 0, 1) or rgbm(0, 0.6, 0, 1)
-            ui.textColored(dText, dColor)
-            ui.popFont()
-            
-            if scOvertakeTimer > 0 then
-                ui.drawRectFilled(vec2(centerX - 250, 155), vec2(centerX + 250, 205), rgbm(1, 0, 0, 0.9), 5)
-                ui.setCursor(vec2(centerX - 230, 165))
-                ui.pushFont(ui.Font.Title)
-                ui.textColored("REDUCE SPEED! PENALTY: " .. string.format("%.1f", 3.0 - scOvertakeTimer) .. "s", rgbm(1, 1, 1, 1))
-                ui.popFont()
+            if targetCarName == "SAFETY CAR" then
+                local me = ac.getCar(0)
+                local distToSC = (scPos - me.splinePosition) * trackLength
+                if distToSC < -trackLength/2 then distToSC = distToSC + trackLength end
+                
+                local dText = "DISTANCE: " .. math.floor(distToSC) .. "m"
+                local dSize = ui.measureText(dText)
+                local dColor = (distToSC < 15 or distToSC > 60) and rgbm(1, 0, 0, 1) or rgbm(0, 0.5, 0, 1)
+                
+                ui.setCursor(vec2(centerX - dSize.x/2, 110))
+                ui.textColored(dText, dColor)
+                
+                -- Таймер штрафа
+                if scOvertakeTimer > 0 then
+                    ui.drawRectFilled(vec2(centerX - 250, 190), vec2(centerX + 250, 240), rgbm(1, 0, 0, 0.9), 5)
+                    ui.setCursor(vec2(centerX - 230, 200))
+                    ui.pushFont(ui.Font.Title)
+                    ui.textColored("REDUCE SPEED! PENALTY: " .. string.format("%.1f", 3.0 - scOvertakeTimer) .. "s", rgbm(1, 1, 1, 1))
+                    ui.popFont()
+                end
             end
         end
     end
     
-    if messageTimer > 0 then
-        local mSize = ui.measureText(message)
-        ui.setCursor(vec2(centerX - mSize.x/2, 220))
-        ui.pushFont(ui.Font.Title)
-        ui.textColored(message, rgbm(0, 1, 0, 1))
-        ui.popFont()
-    end
+    ui.setCursor(vec2(10, 10))
+    ui.text("DRS Oval v2.0 ULTIMATE")
 end
