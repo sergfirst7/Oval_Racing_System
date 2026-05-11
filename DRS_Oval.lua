@@ -1,5 +1,5 @@
--- DRS World: Oval Racing System v1.3 (FULL AUTO)
--- Auto-Caution on slow cars (<40kmh for 3s)
+-- DRS World: Oval Racing System v1.4 (FIXED)
+-- Fixed driverName function error
 
 local STATE = { GREEN = 1, CAUTION = 2, ONE_TO_GREEN = 3 }
 local currentFlag = STATE.GREEN
@@ -9,7 +9,7 @@ local message = ""
 local messageTimer = 0
 
 -- Slow Car Detection
-local slowTimers = {} -- Таймеры для каждой машины
+local slowTimers = {}
 local yellowCooldown = 0
 
 -- Safety Car / Penalty Logic
@@ -18,6 +18,14 @@ local scSpeed = 80 / 3.6
 local trackLength = ac.getSim().trackLengthM
 local overtakeTimer = 0
 local penaltyIssued = false
+
+-- Helper to get driver name safely
+local function getDriverName(car)
+    if not car then return "Unknown" end
+    local name = car.driverName
+    if type(name) == "function" then return name() end
+    return tostring(name)
+end
 
 local function safe(fn)
     return function(...)
@@ -33,7 +41,7 @@ local function getRaceOrder()
         if car and car.isConnected then
             table.insert(order, {
                 id = i,
-                name = car.driverName,
+                name = getDriverName(car),
                 dist = car.lapCount + car.splinePosition,
                 spline = car.splinePosition
             })
@@ -47,16 +55,14 @@ function script.update(dt)
     if messageTimer > 0 then messageTimer = messageTimer - dt end
     if yellowCooldown > 0 then yellowCooldown = yellowCooldown - dt end
     
-    -- АВТО-ДЕТЕКТОР (только если сейчас GREEN)
     if currentFlag == STATE.GREEN and yellowCooldown <= 0 then
         for i = 0, ac.getSim().carsCount - 1 do
             local car = ac.getCar(i)
-            -- Если машина на трассе, подключена и едет медленно
             if car.isConnected and not car.isInPitlane and car.speedKmh < 40 and car.speedKmh > 2 then
                 slowTimers[i] = (slowTimers[i] or 0) + dt
                 if slowTimers[i] > 3.0 then
-                    ac.sendChatMessage("CAUTION: Slow car detected (" .. car.driverName .. ") !yellow")
-                    yellowCooldown = 30 -- Не срабатывать повторно 30 секунд
+                    ac.sendChatMessage("CAUTION: Slow car detected (" .. getDriverName(car) .. ") !yellow")
+                    yellowCooldown = 30
                     break
                 end
             else
@@ -65,10 +71,8 @@ function script.update(dt)
         end
     end
 
-    -- Логика коушна
     if currentFlag ~= STATE.GREEN then
         scPos = (scPos + (scSpeed * dt) / trackLength) % 1
-        
         if targetCarID ~= -1 then
             local me = ac.getCar(0)
             local target = ac.getCar(targetCarID)
@@ -79,7 +83,7 @@ function script.update(dt)
             if distDiff > 0.005 then
                 overtakeTimer = overtakeTimer + dt
                 if overtakeTimer > 2.0 and not penaltyIssued then
-                    ac.sendChatMessage("PENALTY: " .. me.driverName .. " ILLEGAL OVERTAKE!")
+                    ac.sendChatMessage("PENALTY: " .. getDriverName(me) .. " ILLEGAL OVERTAKE!")
                     penaltyIssued = true
                 end
             else
@@ -131,20 +135,5 @@ function script.drawUI()
         ui.popFont()
         ui.setCursor(vec2(centerX - 140, 90))
         ui.textColored("FOLLOW: " .. targetCarName, rgbm(0, 0, 0, 1))
-        
-        if overtakeTimer > 0 then
-            ui.setCursor(vec2(centerX - 120, 120))
-            ui.textColored("!!! GIVE BACK POSITION !!!", rgbm(1, 0, 0, 1))
-        end
-    end
-    
-    if currentFlag ~= STATE.GREEN and targetCarName == "SAFETY CAR" then
-        local scWorldPos = ac.getTrackFullSpline():posAt(scPos)
-        local screenPos = ac.worldToScreen(scWorldPos)
-        if screenPos.z > 0 then
-            ui.setCursor(vec2(screenPos.x - 50, screenPos.y - 100))
-            ui.drawRectFilled(vec2(screenPos.x - 60, screenPos.y - 110), vec2(screenPos.x + 60, screenPos.y - 70), rgbm(1, 0.8, 0, 0.8), 10)
-            ui.textColored("SAFETY CAR", rgbm(0, 0, 0, 1))
-        end
     end
 end
