@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 8.1'
+local VERSION = 'Oval 8.5'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -14,19 +14,24 @@ local cfg = ac.configValues({
   paceLeadM = 300,     -- how far ahead of the race leader the pace car appears
   autoCaution = 1,     -- 1: a wreck or a car stopped on track calls the caution automatically
   slowKmh = 40,        -- below this speed a car counts as stopped
+  limpRatio = 0.5,     -- a car that stays below this share of its own top speed (and under 110 km/h) counts as stopped, 0 = off
+  wreckDropKmh = 60,   -- losing this much speed within 0.4 s (35 within a second of a contact) is a wreck
   stopSec = 3,         -- how long a car must stay that slow to count as an incident
   raceKmh = 80,        -- a car only counts after it has been this fast since the last green
-  startGraceSec = 20,  -- no automatic caution during the first seconds of the race
-  cooldownSec = 20,    -- no automatic caution right after a green flag
-  cautionLaps = 2,     -- pace laps before the field may be sent back to green
-  maxCautionLaps = 6,  -- restart anyway after this many pace laps
+  cooldownSec = 4,     -- no automatic caution in the first seconds after a green flag
+  rolling = 1,         -- 1: the race starts behind the pace car (rolling start); 0: standing start
+  formationLaps = 1,   -- pace laps of the rolling start before the field may go green
+  startLeadM = 40,     -- how far ahead of pole position the pace car starts
+  cautionLaps = 1,     -- pace laps before the field may be sent back to green
+  maxCautionLaps = 4,  -- restart anyway after this many pace laps
+  oneToGoAt = 0.75,    -- the pace car leaves in the last quarter of a lap (track position 0..1), green at the line
   everySession = 0,    -- 1: run in every session, not only in races (testing)
   debug = 0,           -- 1: show the debug panel (chat command !ovaldebug toggles it for you)
 })
 
 local GREEN, CAUTION, ONE_TO_GO = 0, 1, 2
 local NONE, ORDER_MAX, STOP_KMH, RANK_DELAY = 255, 48, 25, 0.4
-local TITLES = { [0] = 'CAUTION', [1] = 'CAUTION - CAR STOPPED', [3] = 'CAUTION - WRECK' }
+local TITLES = { [0] = 'CAUTION', [1] = 'CAUTION - CAR STOPPED', [2] = 'ROLLING START', [3] = 'CAUTION - WRECK' }
 
 local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
@@ -96,16 +101,19 @@ local function pacePos() return frac(S.s0 + S.kmh / 3.6 * (clock() - S.tStart) /
 
 local function ahead(a, b) -- is car a ahead of car b in the race
   if a.racePosition > 0 and b.racePosition > 0 and a.racePosition ~= b.racePosition then return a.racePosition < b.racePosition end
+  if S.seq == 0 and a.lapCount == 0 and b.lapCount == 0 then return frac(-a.splinePosition) < frac(-b.splinePosition) end -- on the grid: closest before the line
   return a.lapCount + a.splinePosition > b.lapCount + b.splinePosition
 end
 
+-- reason: 0 admin, 1 stopped car, 2 rolling start, 3 wreck
 local function deploy(reason, cause)
   local cars, head = activeCars(), nil
   for _, c in pairs(cars) do
     if not c.isInPitlane and (not head or ahead(c, head)) then head = c end
   end
   if not head then return end
-  local s0, list = frac(head.splinePosition + cfg.paceLeadM / trackLen()), {}
+  local lead = reason == 2 and cfg.startLeadM or cfg.paceLeadM
+  local s0, list = frac(head.splinePosition + lead / trackLen()), {}
   for _, c in pairs(cars) do
     if not c.isInPitlane and not c.isRetired then list[#list + 1] = c end
   end
@@ -127,10 +135,11 @@ local function localCheck(cars)
   for i, id in ipairs(S.order) do if id == me.sessionID then idx = i break end end
   if not idx then L1 = {} return end
 
+  local launching = S.reason == 2 and clock() - S.tStart < 15000 -- cars still accelerate from the grid
   local ref, key, refPos
   for j = idx - 1, 1, -1 do -- nearest car ahead that is on track and moving
     local c = cars[S.order[j]]
-    if c and not c.isInPitlane and c.speedKmh > STOP_KMH then ref, key, refPos = c, c.sessionID, c.splinePosition break end
+    if c and not c.isInPitlane and (c.speedKmh > STOP_KMH or launching) then ref, key, refPos = c, c.sessionID, c.splinePosition break end
   end
   if not ref and S.phase == CAUTION then key, refPos = 'pace', pacePos() end
   if not refPos then -- leader after the pace car has left: hold the pace until the green flag
@@ -151,38 +160,64 @@ local function localCheck(cars)
   local speed = me.speedKmh
   L1.allowed = cfg.paceKmh + clamp((L1.rel - cfg.bunchGapM) / (4 * cfg.bunchGapM), 0, 1) * cfg.catchupKmh
   L1.speeding = speed > L1.allowed + cfg.speedTolKmh
-  L1.passing = L1.rel < -3
+  L1.passing = L1.rel < (S.reason == 2 and -12 or -3) -- the grid is two abreast, a few metres either way are fine
   L1.lagging = L1.rel > 4 * cfg.bunchGapM and speed < cfg.paceKmh - 20
 end
 
 -- ── incidents: every client watches its own car ──────────────────────────────
--- A wreck (hit + speed collapse) calls the caution at once, a car that stays slow for stopSec
--- calls it too. Remote cars are not watched: their data is late, and the owner knows best.
-pcall(ac.onCarCollision, 0, function()
-  if (watch.peak or 0) > 100 then watch.hit = { t = uiTime, peak = watch.peak } end
+-- Own data is the only reliable data. A wreck is a sudden loss of speed (with or without a contact
+-- event), a car that stays slow for stopSec is stopped: standing, or limping below limpRatio of the
+-- speed it was doing. Remote cars are not watched: their data is late and the owner knows best.
+local okHit, errHit = pcall(ac.onCarCollision, 0, function()
+  local peak = watch.peak or 0
+  if uiTime - (watch.hitLog or -5) > 2 then
+    watch.hitLog = uiTime
+    ac.log(string.format('Oval: contact, speed=%d peak=%d', math.floor(ac.getCar(0).speedKmh), math.floor(peak)))
+  end
+  if peak > 100 then watch.hit = { t = uiTime, peak = peak } end
 end)
+if not okHit then ac.log('Oval: contact events unavailable: ' .. tostring(errHit)) end
 
 local function watchSelf(dt, now)
   local me = ac.getCar(0)
   local speed = me.speedKmh
   watch.peak = math.max(speed, (watch.peak or 0) - 150 * dt) -- speed of the last second or so
+  watch.top = math.max(speed, (watch.top or 0) - 3 * dt) -- the speed we were doing, forgotten slowly
+  local h = watch.hist or {}
+  watch.hist = h
+  h[#h + 1] = { t = uiTime, v = speed }
+  while uiTime - h[1].t > 1 do table.remove(h, 1) end
+  local function lost(window) -- speed lost within the last `window` seconds
+    local top = speed
+    for _, x in ipairs(h) do if uiTime - x.t <= window and x.v > top then top = x.v end end
+    return top - speed
+  end
+
   if speed > cfg.raceKmh then watch.fast = true end
-  if cfg.autoCaution ~= 1 or not watch.fast or me.isInPitlane or me.isRetired or now < cfg.startGraceSec * 1000
-    or (S.seq > 0 and now - S.tStart < cfg.cooldownSec * 1000) then
+  if cfg.autoCaution ~= 1 or not watch.fast or me.isInPitlane or me.isRetired or (S.seq > 0 and now - S.tStart < cfg.cooldownSec * 1000) then
     watch.slow, watch.hit = 0, nil
     return
   end
-  local h = watch.hit
-  if h and uiTime - h.t > 2.5 then watch.hit = nil
-  elseif h and speed < h.peak * 0.35 then return deploy(3, me.sessionID) end
-  watch.slow = speed < cfg.slowKmh and (watch.slow or 0) + dt or 0
-  if watch.slow >= cfg.stopSec then deploy(1, me.sessionID) end
+  local hit = watch.hit
+  if hit and uiTime - hit.t > 2.5 then hit = nil; watch.hit = nil end
+  local recent = hit and uiTime - hit.t < 1
+  if lost(0.4) >= cfg.wreckDropKmh or (recent and lost(1) >= 35) or (hit and speed < hit.peak * 0.35) then
+    ac.log(string.format('Oval: wreck, speed=%d lost=%d contact=%s', math.floor(speed), math.floor(lost(1)), tostring(hit ~= nil)))
+    return deploy(3, me.sessionID)
+  end
+  local slow = speed < cfg.slowKmh or (cfg.limpRatio > 0 and speed < cfg.limpRatio * watch.top and speed < 110)
+  watch.slow = slow and (watch.slow or 0) + dt or 0
+  if watch.slow >= cfg.stopSec then
+    ac.log(string.format('Oval: stopped car, speed=%d top=%d', math.floor(speed), math.floor(watch.top)))
+    deploy(1, me.sessionID)
+  end
 end
 
 -- ── restart handling: every client computes it, the lowest session ID acts first ─────────
 -- A client only acts after `rank * RANK_DELAY` seconds without a newer state, so a car whose
 -- driver has no script cannot stall the flow: the next one takes over.
 local pend, lastLeader, bunchT = { key = nil }, nil, 0
+local start = {}
 local function due(key, rank)
   if pend.key ~= key or pend.seq ~= S.seq or uiTime - pend.last > 0.5 then pend = { key = key, seq = S.seq, at = uiTime } end
   pend.last = uiTime
@@ -252,16 +287,23 @@ local function control(cars, dt, rank)
   local order = desiredOrder(cars)
   if order and due('order', rank) then return commit(S.phase, S.reason, S.cause, S.tStart, S.s0, order) end
 
-  local laps = S.kmh / 3.6 * (clock() - S.tStart) / 1000 / trackLen()
-  if S.phase == CAUTION and laps >= cfg.cautionLaps and bunched(cars) and not hazard(cars) then bunchT = bunchT + dt else bunchT = 0 end
-  if leaderCrossed(cars) then ctl.cross = { at = uiTime, go = S.phase == ONE_TO_GO or bunchT > 1.5 or laps >= cfg.maxCautionLaps } end
-  local x = ctl.cross
-  if not (x and x.go and uiTime - x.at < 2.5 + rank * RANK_DELAY) then return end
-  if S.phase == ONE_TO_GO then
-    if due('green', rank) then release() end
-  elseif due('one', rank) then
-    commit(ONE_TO_GO, S.reason, S.cause, clock(), pacePos(), S.order)
+  local len = trackLen()
+  if S.phase == CAUTION then
+    local laps = S.kmh / 3.6 * (clock() - S.tStart) / 1000 / len
+    local need = S.reason == 2 and cfg.formationLaps or cfg.cautionLaps
+    if bunched(cars) and not hazard(cars) then bunchT = bunchT + dt else bunchT = 0 end
+    local pos = pacePos()
+    -- laps counted up to the line where the flag will turn green; a tenth of a lap of slack for the head start
+    local ready = laps >= cfg.maxCautionLaps or (laps + 1 - pos >= need - 0.1 and bunchT > 1.5)
+    if ready and pos >= cfg.oneToGoAt and due('one', rank) then -- the pace car pulls off before the last turns
+      commit(ONE_TO_GO, S.reason, S.cause, clock(), pos, S.order)
+    end
+    return
   end
+  -- one to go: green when the leader crosses the line; after 1.5 laps in any case (nobody left to cross it)
+  if leaderCrossed(cars) then ctl.cross = uiTime end
+  local late = clock() - S.tStart > 1500 * len / (S.kmh / 3.6)
+  if (late or (ctl.cross and uiTime - ctl.cross < 2.5 + rank * RANK_DELAY)) and due('green', rank) then release() end
 end
 
 -- ── entry points ─────────────────────────────────────────────────────────────
@@ -273,7 +315,7 @@ local function guard(fn)
 end
 
 local function isActive() return cfg.everySession == 1 or sim.raceSessionType == ac.SessionType.Race end
-local function reset() S, L1, watch, ctl = freshState(), {}, {}, {} end
+local function reset() S, L1, watch, ctl, start = freshState(), {}, {}, {}, {} end
 ac.onSessionStart(reset)
 
 -- Chat commands: !ovaldebug (anyone, only for yourself), !yellow / !green (admin)
@@ -285,6 +327,36 @@ ac.onOutgoingChatMessage(function(msg)
   if cmd == 'yellow' then deploy(0, NONE) else release() end
   return true
 end)
+
+-- The session clock starts at 0 when the session is created, 30 s before the lights go out, so it
+-- says nothing about the start. Signals: the countdown of the game (timeToSessionStart) has run
+-- out, or the field that stood on the grid has started to move.
+local function lightsOut(cars, now)
+  local tts, fast = sim.timeToSessionStart, 0
+  for _, c in pairs(cars) do fast = math.max(fast, c.speedKmh) end
+  if tts and tts > 1000 then start.armed = true end
+  if fast < 15 and now < 120000 then start.grid = true end -- has seen the whole field standing
+  if start.grid and not start.done and uiTime - (start.logAt or -10) > 5 then
+    start.logAt = uiTime
+    ac.log(string.format('Oval: waiting for the lights, tts=%s started=%s clock=%d fast=%d', tostring(tts), tostring(sim.isSessionStarted), math.floor(now), math.floor(fast)))
+  end
+  -- the countdown decides; movement counts only when the game gives no countdown (cars jump to the grid at the start of a session)
+  local ended = start.armed and (tts or -1) <= 0
+  local moved = not start.armed and now > 3000 and fast > 15
+  return start.grid and (ended or moved)
+end
+
+local function startRace(cars, rank, now) -- lights out: the field follows the pace car instead of racing away
+  if S.seq > 0 then start.done = true end
+  if cfg.rolling ~= 1 or start.done or not lightsOut(cars, now) or not due('start', rank) then return end
+  local list = {}
+  for id, c in pairs(cars) do list[#list + 1] = string.format('%d:p%d:%.4f', id, c.racePosition, c.splinePosition) end
+  deploy(2, NONE)
+  if S.seq > 0 then
+    start.done = true
+    ac.log(string.format('Oval: lights out (tts=%s clock=%d), rolling start, grid %s', tostring(sim.timeToSessionStart), math.floor(now), table.concat(list, ' ')))
+  end
+end
 
 function script.update(dt)
   guard(function()
@@ -299,7 +371,7 @@ function script.update(dt)
     local rank = 0
     for id in pairs(cars) do if id < me.sessionID then rank = rank + 1 end end
     hudCars, hudRank = cars, rank
-    if S.phase == GREEN then watchSelf(dt, now) end
+    if S.phase == GREEN then startRace(cars, rank, now); watchSelf(dt, now) end
     control(cars, dt, rank)
     localCheck(cars)
   end)()
@@ -336,7 +408,7 @@ function script.drawUI()
     elseif S.phase == CAUTION then
       title, bg = TITLES[S.reason] or 'CAUTION', YELLOW
       local who = hudCars[S.cause]
-      note = who and ac.getDriverName(who.index)
+      note = S.reason == 2 and 'HOLD YOUR POSITION - GREEN AT THE LINE' or who and ac.getDriverName(who.index)
     end
     local h = 44 + (note and 24 or 0) + (showGreen and 0 or 28 + (L1.allowed and 32 or 0))
     ui.drawRectFilled(vec2(cx - 250 * k, y), vec2(cx + 250 * k, y + h * k), bg, 10 * k)

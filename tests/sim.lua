@@ -10,7 +10,7 @@ local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
 local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {} } -- t in seconds
-local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup = 0, {}, {}, {}, 60 end
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0 end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
 local dummy
@@ -19,7 +19,7 @@ local function noop() end
 
 local function newEnv(client, cfgOverride)
   local car = client.car
-  local sim = { carsCount = #W.cars, trackLengthM = TRACK, currentSessionTime = 0, raceSessionType = 3, isSessionStarted = true, isOnlineRace = true, isAdmin = client.admin }
+  local sim = { carsCount = #W.cars, trackLengthM = TRACK, currentSessionTime = 0, raceSessionType = 3, isSessionStarted = true, timeToSessionStart = -1, isOnlineRace = true, isAdmin = client.admin }
   client.sim = sim
   local env = setmetatable({ OVAL_TEST = true, script = {}, math = math, string = string, table = table, pairs = pairs, ipairs = ipairs,
     pcall = pcall, tostring = tostring, type = type, next = next, setmetatable = setmetatable }, { __index = function(_, k) return rawget(_G, k) end })
@@ -29,7 +29,12 @@ local function newEnv(client, cfgOverride)
     getSim = function() return sim end,
     configValues = function(layout)
       local c = {}
-      for k, v in pairs(layout) do c[k] = (cfgOverride and cfgOverride[k]) or v end
+      for k, v in pairs(layout) do
+        local o = cfgOverride and cfgOverride[k]
+        if o == nil then o = W.defaults[k] end -- tests start standing unless a scenario asks for a rolling start
+        if o == nil then o = v end
+        c[k] = o
+      end
       return c
     end,
     getCar = function(i)
@@ -105,7 +110,7 @@ local function disconnect(client) client.connected, client.car.isConnected, clie
 
 -- A driver who follows the rules: closes gaps like a human would, never above the limit.
 local function target(car, phase, pace, paceKmh)
-  if car.stopped then return 0 end
+  if car.stopped or (W.hold and W.t < 0) then return 0 end
   if phase == GREEN or car.ignore then return car.cruise end
   if phase == ONE_TO_GO then return paceKmh - 4 end
   local gap, aheadKmh = TRACK, paceKmh
@@ -125,7 +130,10 @@ end
 local function step()
   W.t = W.t + DT
   local ms = W.t * 1000
-  for _, cl in ipairs(W.clients) do cl.sim.currentSessionTime, cl.sim.carsCount = ms, #W.cars end
+  for _, cl in ipairs(W.clients) do
+    cl.sim.currentSessionTime, cl.sim.carsCount = ms + W.clockOffset * 1000, #W.cars
+    cl.sim.timeToSessionStart = W.tts and math.max(-1, -ms) or -1 -- the game's countdown, -1 when it is not available
+  end
   -- deliver messages
   local rest = {}
   for _, m in ipairs(W.queue) do
@@ -300,7 +308,7 @@ local function scenarioAuto()
     prev = byId[id]
   end
   print(string.format('     one to go after %.0f s of caution, widest gap in the pack %.0f m', W.t - cautionAt, worst))
-  check(W.t - cautionAt > 100, 'at least cautionLaps pace laps first')
+  check(W.t - cautionAt > 85 and W.t - cautionAt < 160, 'one pace lap, not three: one to go after ' .. string.format('%.0f', W.t - cautionAt) .. ' s')
   check(worst < 60, 'the field is bunched when one to go is shown')
   runClean(1)
   everyone(ONE_TO_GO, 'shows one to go')
@@ -313,11 +321,12 @@ local function scenarioAuto()
   everyone(GREEN, 'is green')
   check(W.sends - sends0 <= 6, 'the whole restart took ' .. (W.sends - sends0) .. ' messages, not one per client')
   check(not watch.dirty, 'compliant drivers were never warned during the whole caution' .. (watch.dirty and (': ' .. watch.dirty) or ''))
+  local greenAt = W.t
   byId[5].stopped = true -- stops again right after the restart
-  run(18)
-  everyone(GREEN, 'stays green during the cooldown although a car is standing')
+  run(2)
+  everyone(GREEN, 'stays green during the short cooldown although a car is standing')
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the next caution')
-  check(W.clients[1].oval.state().cause == 5, 'the next caution comes after the cooldown')
+  check(W.clients[1].oval.state().cause == 5 and W.t - greenAt > 4, 'the next caution comes after the cooldown (' .. string.format('%.1f', W.t - greenAt) .. ' s)')
 end
 
 local function scenarioStraggler()
@@ -356,18 +365,54 @@ local function scenarioGiveUp()
 end
 
 local function scenarioWreck()
-  print('== a wreck calls the caution at once, a scrape does not')
-  local byId = field(8, 45, 200)
+  print('== a wreck calls the caution at once, a scrape or hard braking does not')
+  local byId = field(8, 45, 250)
   run(30)
-  byId[5].speedKmh = 185; W.clients[5].hitcb(0) -- brushes the wall and keeps going
+  byId[5].speedKmh = 235; W.clients[5].hitcb(0) -- brushes the wall and keeps going
   run(5)
   everyone(GREEN, 'a scrape that costs 15 km/h is no wreck')
-  byId[5].speedKmh = 185; W.clients[5].hitcb(0)
-  byId[5].speedKmh = 45 -- the same hit, but the car is nearly stopped
+  byId[5].speedKmh, byId[5].cruise = 250, 190 -- braking hard for something: 60 km/h in under two seconds
+  run(6)
+  everyone(GREEN, 'hard braking is no wreck')
+  byId[5].cruise = 250
+  run(8)
+  byId[5].speedKmh = 210 -- a jolt of 40 km/h without any contact event
+  run(3)
+  everyone(GREEN, 'a 40 km/h jolt without a contact is no wreck')
+  byId[5].speedKmh = 250; W.clients[5].hitcb(0)
+  byId[5].speedKmh, byId[5].cruise = 140, 140 -- a hard hit that leaves the car rolling at 140 km/h
   local t0 = W.t
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 5, 'the wreck caution')
   local st = W.clients[1].oval.state()
-  check(st.reason == 3 and st.cause == 5 and st.from == 5 and W.t - t0 < 1.5, 'the wreck is reported by the car itself within a moment (' .. string.format('%.1f', W.t - t0) .. ' s)')
+  check(st.reason == 3 and st.cause == 5 and st.from == 5 and W.t - t0 < 1.5, 'a hit that keeps the car at 140 km/h is a wreck, reported by the car itself (' .. string.format('%.1f', W.t - t0) .. ' s)')
+
+  print('== the contact event is not needed')
+  byId = field(8, 45, 250)
+  run(30)
+  byId[4].speedKmh, byId[4].cruise = 120, 120 -- 130 km/h lost in a moment, no contact callback at all
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 5, 'the caution without a contact event')
+  check(W.clients[1].oval.state().reason == 3 and W.clients[1].oval.state().cause == 4, 'a sudden loss of speed alone is enough')
+
+  print('== a limping car')
+  byId = field(8, 45, 250)
+  run(30)
+  byId[6].cruise = 90 -- dragging along the wall at 90 km/h
+  local t1 = W.t
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution for the limping car')
+  check(W.clients[1].oval.state().reason == 1 and W.clients[1].oval.state().cause == 6, 'a car far below its own speed is stopped, not only one that stands (' .. string.format('%.1f', W.t - t1) .. ' s)')
+
+  print('== a wreck right after the green flag')
+  byId = field(8, 45, 250, nil, 1)
+  run(30)
+  W.clients[1].chat('!yellow')
+  run(2)
+  W.clients[1].chat('!green')
+  local greenAt = W.t
+  for _, c in pairs(byId) do c.cruise = 250 end
+  run(5) -- the cooldown is 4 s
+  byId[3].speedKmh, byId[3].cruise = 90, 90
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 5, 'the caution right after the restart')
+  check(W.clients[1].oval.state().reason == 3 and W.t - greenAt < 8, 'a wreck a few seconds after the green flag is covered too (' .. string.format('%.1f', W.t - greenAt) .. ' s)')
 end
 
 local function scenarioGrid()
@@ -381,6 +426,82 @@ local function scenarioGrid()
   byId[3].stopped = true
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution after the start')
   check(W.clients[1].oval.state().cause == 3, 'but a car that stops after racing does')
+end
+
+local function grid(n)
+  local byId, initial = {}, {}
+  for i = 1, n do -- two abreast, rows 20 m apart, the outside car 8 m behind its row mate
+    byId[i] = addCar(i, 0.999 - (math.ceil(i / 2) - 1) * 20 / TRACK - (i % 2 == 0 and 8 or 0) / TRACK, 0, { cruise = 200 })
+    initial[i] = byId[i]
+  end
+  for _, c in ipairs(initial) do addClient(c, false) end
+  return byId
+end
+
+local function scenarioRolling(useCountdown)
+  print(useCountdown and '== rolling start on the countdown signal' or '== rolling start when the countdown is not available')
+  resetWorld()
+  W.defaults.rolling, W.hold, W.tts, W.clockOffset = 1, true, useCountdown, 6 -- the session clock is already running during the lights
+  local byId = grid(10)
+  W.t = -6
+  run(1)
+  byId[3].speedKmh = 40 -- cars jump to the grid at the start of the session: a speed spike, not a start
+  run(4.5)
+  everyone(GREEN, 'the field waits while the lights count down, a speed spike from the grid teleport is no start')
+  check(W.clients[1].oval.state().seq == 0, 'nothing was sent during the countdown')
+  local watch = {}
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 6, 'the rolling start')
+  local st = W.clients[1].oval.state()
+  local delay = W.t
+  check(st.reason == 2 and st.from == 1 and delay >= 0 and delay < (useCountdown and 0.6 or 3), 'the pace car is released when the lights go out (' .. string.format('%.1f', delay) .. ' s after)')
+  check(table.concat(st.order, ',') == '1,2,3,4,5,6,7,8,9,10', 'the order is the grid order (' .. table.concat(st.order, ',') .. ')')
+  local started = W.t
+  run(3)
+  local one, two = byId[1], byId[2] -- the outside car of the first row edges 8 m ahead of its row mate while launching
+  two.splinePosition = one.splinePosition + 8 / TRACK
+  run(0.5)
+  check(not W.clients[2].oval.local1().passing, 'a row mate 8 m ahead on the launch is not yet a pass')
+  two.splinePosition = one.splinePosition - 8 / TRACK
+  for _ = 1, math.floor(300 / DT) do
+    step(); watchClean(watch, started + 25)
+    if W.clients[1].oval.state().phase == GREEN and W.t > started + 20 then break end
+  end
+  local g = W.clients[1].oval.state()
+  local took = W.t - started
+  check(g.phase == GREEN and g.reason == 0 and g.seq > st.seq and took > 85 and took < 135, 'one pace lap, then the start: green after ' .. string.format('%.0f', took) .. ' s')
+  check(g.seq == st.seq + 2, 'the pace car left on the last part of that lap: exactly two messages (one to go, green), not an extra lap')
+  check(not watch.dirty, 'nobody who followed the rules was warned' .. (watch.dirty and (': ' .. watch.dirty) or ''))
+  run(40)
+  everyone(GREEN, 'the race goes on green, no automatic caution right after the start')
+end
+
+local function scenarioNotARace()
+  print('== practice and qualifying: nothing happens')
+  resetWorld()
+  W.defaults.rolling, W.hold, W.clockOffset = 1, true, 6
+  local byId = grid(6)
+  for _, cl in ipairs(W.clients) do cl.sim.raceSessionType = 2 end
+  W.t = -6
+  run(10)
+  W.clients[3].hitcb(0); byId[3].speedKmh = 20 -- a wreck
+  byId[4].stopped = true -- and a car that stops
+  run(30)
+  for _, cl in ipairs(W.clients) do check(cl.oval.state().seq == 0, 'client ' .. cl.car.sessionID .. ' saw no pace car in qualifying') end
+  check(W.clients[1].chat('!yellow') == false, 'even !yellow is not handled outside a race')
+end
+
+local function scenarioLeaderless()
+  print('== nobody is left to cross the line')
+  local byId = field(6, 45, 200, { cautionLaps = 1 })
+  run(30)
+  byId[3].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  byId[3].isInPitlane = true
+  untilTrue(function() return W.clients[1].oval.state().phase == ONE_TO_GO end, 400, 'one to go')
+  for _, c in pairs(byId) do c.isInPitlane = true end -- everybody dives into the pits
+  local at = W.t
+  untilTrue(function() return W.clients[1].oval.state().phase == GREEN end, 200, 'the green flag')
+  check(W.t - at < 150, 'the flag turns green by itself after 1.5 laps (' .. string.format('%.0f', W.t - at) .. ' s)')
 end
 
 local function scenarioNoScript()
@@ -404,6 +525,10 @@ end
 scenarioManual()
 scenarioWreck()
 scenarioGrid()
+scenarioRolling(true)
+scenarioRolling(false)
+scenarioNotARace()
+scenarioLeaderless()
 scenarioNoScript()
 scenarioAuto()
 scenarioGiveUp()
