@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 8.8'
+local VERSION = 'Oval 9.0'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -19,6 +19,13 @@ local cfgDefaults = {
   stopSec = 3,         -- how long a car must stay that slow to count as an incident
   raceKmh = 80,        -- a car only counts after it has been this fast since the last green
   cooldownSec = 4,     -- no automatic caution in the first seconds after a green flag
+  penalty = 'drive',   -- what breaking the pace rules costs: 'off' (warnings only), 'slow' (up to a gas cut), 'drive' (up to a drive-through)
+  graceSec = 6,        -- time to slow down after the pace car appears before violations count
+  speedSec = 4,        -- being too fast for this long is a violation
+  passSec = 1.2,       -- being ahead of the car in front for this long is a violation
+  strikeGapSec = 8,    -- the same violation is counted at most once per this many seconds
+  slowSec = 5,         -- length of the gas cut penalty
+  driveLaps = 2,       -- laps to serve a drive-through
   rolling = 1,         -- 1: the race starts behind the pace car (rolling start); 0: standing start
   formationLaps = 1,   -- pace laps of the rolling start before the field may go green
   startLeadM = 40,     -- how far ahead of pole position the pace car starts
@@ -67,6 +74,7 @@ end
 local function freshState() return { seq = 0, from = NONE, phase = GREEN, reason = 0, cause = NONE, tStart = 0, s0 = 0, kmh = 0, order = {} } end
 local S = freshState()
 local L1, watch, ctl = {}, {}, {} -- rules of the local car / incident watch of the local car / restart bookkeeping
+local pen, penNote, lastContact = { strikes = 0, last = {} }, nil, -100 -- penalties of the local car, the message about the last one, last contact
 local uiTime, lastClock, lastError, hudCars, hudRank, debugOn, greeted = 0, 0, nil, {}, 0, cfg.debug == 1, false
 
 local function adopt(new) -- local state survives order updates of the same deployment
@@ -74,6 +82,7 @@ local function adopt(new) -- local state survives order updates of the same depl
   if new.seq ~= S.seq or new.from ~= S.from then
     ac.log(string.format('Oval: state seq=%d from=%d phase=%d reason=%d cause=%d cars=%d clock=%d', new.seq, new.from, new.phase, new.reason, new.cause, #new.order, math.floor(clock())))
   end
+  if new.phase == CAUTION and S.phase == GREEN then pen.strikes, pen.last = 0, {} end -- a new deployment: a clean sheet
   S = new
 end
 
@@ -160,10 +169,65 @@ end
 
 local function release() commit(GREEN, 0, NONE, clock(), 0, {}) end
 
+-- ── penalties ────────────────────────────────────────────────────────────────
+-- Every client judges its own car. Violations are counted per pace car deployment: the first one
+-- is a warning, the second cuts the gas, from the third on a drive-through is due (unless one is
+-- still pending). Passing the pace car and jumping the restart count double.
+local function setPenalty(kind, param)
+  local good, err = pcall(function() physics.setCarPenalty(ac.PenaltyType[kind], param) end)
+  if not good then ac.log('Oval: penalty ' .. kind .. ' could not be applied: ' .. tostring(err)) end
+  return good
+end
+
+local function penalize(why, weight)
+  if uiTime - (pen.last[why] or -100) < cfg.strikeGapSec then return end -- the same offence at most once per gap
+  pen.last[why], pen.strikes = uiTime, pen.strikes + weight
+  local level, title, applied = pen.strikes, 'WARNING', true
+  if cfg.penalty ~= 'off' and level >= 2 then
+    if cfg.penalty == 'drive' and level >= 3 and not pen.driving then
+      title = 'DRIVE-THROUGH PENALTY'
+      applied = setPenalty('MandatoryPits', cfg.driveLaps)
+      if applied then pen.driving, pen.pitSeen = true, false end
+    else
+      title = 'GAS CUT ' .. cfg.slowSec .. ' S'
+      applied = setPenalty('SlowDown', cfg.slowSec)
+    end
+  end
+  if not applied then title = title .. ' (NOT ENFORCED)' end
+  penNote = { title = title, why = why, untilT = uiTime + 7 }
+  pcall(ac.setMessage, title, why, 'illegal', 7)
+  ac.log(string.format('Oval: %s - %s (strikes %d)', title, why, level))
+end
+
+-- being too fast or ahead of the car in front counts only when it lasts, and not right after
+-- the pace car appeared, not in the pits and not right after a contact (we may have been pushed)
+local function judge(dt)
+  local grace = S.phase == CAUTION and (S.reason == 2 and 15 or cfg.graceSec) or 0
+  local free = clock() - S.tStart < grace * 1000 or uiTime - lastContact < 3
+  L1.speedT = L1.speeding and not free and (L1.speedT or 0) + dt or 0
+  L1.passT = L1.passing and not free and (L1.passT or 0) + dt or 0
+  if L1.speedT >= cfg.speedSec then
+    L1.speedT = 0
+    penalize(S.phase == ONE_TO_GO and 'Too fast before the green flag' or 'Speeding behind the pace car', 1)
+  end
+  if L1.passT >= cfg.passSec then
+    L1.passT = 0
+    local pace, restart = L1.key == 'pace', S.phase == ONE_TO_GO
+    penalize(pace and 'Passed the pace car' or restart and 'Jumped the restart' or 'Passed under caution', (pace or restart) and 2 or 1)
+  end
+end
+
+-- a drive-through is served once the car has been through the pit lane
+local function servePenalty(me)
+  if not pen.driving then return end
+  if me.isInPitlane then pen.pitSeen = true
+  elseif pen.pitSeen then pen.driving = false; ac.log('Oval: drive-through served') end
+end
+
 -- ── rules for the local car ──────────────────────────────────────────────────
 -- Tracks the signed distance to the car we must follow (rel > 0: it is ahead). It is integrated
 -- frame by frame, because on a ring "ahead by 0.95 lap" and "behind by 0.05 lap" look the same.
-local function localCheck(cars)
+local function localCheck(cars, dt)
   local me = ac.getCar(0)
   if S.phase == GREEN or me.isInPitlane then L1 = {} return end
   local idx
@@ -180,7 +244,7 @@ local function localCheck(cars)
   if not refPos then -- leader after the pace car has left: hold the pace until the green flag
     L1.rel, L1.passing, L1.lagging, L1.allowed = nil, false, false, cfg.paceKmh
     L1.speeding = me.speedKmh > L1.allowed + cfg.speedTolKmh
-    return
+    return judge(dt)
   end
 
   local len, raw = trackLen(), refPos - me.splinePosition
@@ -197,6 +261,7 @@ local function localCheck(cars)
   L1.speeding = speed > L1.allowed + cfg.speedTolKmh
   L1.passing = L1.rel < (S.reason == 2 and -12 or -3) -- the grid is two abreast, a few metres either way are fine
   L1.lagging = L1.rel > 4 * cfg.bunchGapM and speed < cfg.paceKmh - 20
+  judge(dt)
 end
 
 -- ── incidents: every client watches its own car ──────────────────────────────
@@ -204,6 +269,7 @@ end
 -- event), a car that stays slow for stopSec is stopped: standing, or limping below limpRatio of the
 -- speed it was doing. Remote cars are not watched: their data is late and the owner knows best.
 local okHit, errHit = pcall(ac.onCarCollision, 0, function()
+  lastContact = uiTime
   local peak = watch.peak or 0
   if uiTime - (watch.hitLog or -5) > 2 then
     watch.hitLog = uiTime
@@ -356,7 +422,7 @@ local function sessionType()
   return good and sess and sess.type or nil
 end
 local function isActive() return cfg.everySession == 1 or sessionType() == RACE end
-local function reset() S, L1, watch, ctl, start, greeted = freshState(), {}, {}, {}, {}, false end
+local function reset() S, L1, watch, ctl, start, greeted, pen, penNote = freshState(), {}, {}, {}, {}, false, { strikes = 0, last = {} }, nil end
 try('session start events', ac.onSessionStart, reset)
 
 -- Chat commands: !ovaldebug (anyone, only for yourself), !yellow / !green (admin)
@@ -533,7 +599,8 @@ function script.update(dt)
     hudCars, hudRank = cars, rank
     if S.phase == GREEN then startRace(cars, rank, now); watchSelf(dt, now) end
     control(cars, dt, rank)
-    localCheck(cars)
+    localCheck(cars, dt)
+    servePenalty(me)
     updatePaceCar()
   end)()
 end
@@ -554,6 +621,7 @@ local function drawDebug()
   local ids = {}
   for id in pairs(presence) do ids[#ids + 1] = id end
   table.sort(ids)
+  ui.dwriteDrawText(string.format('penalty %s  strikes %d  drive-through pending %s  server penalties %s', cfg.penalty, pen.strikes, tostring(pen.driving == true), tostring(sim.penaltiesEnabled)), 13, vec2(12, 90), yel)
   ui.dwriteDrawText(string.format('CSP %s  race %s  direct %s  sent %d got %d stale %d  script on: %s', tostring(build), tostring(sessionType()), tostring(sim.directMessagingAvailable),
     stats.sent, stats.got, stats.stale, table.concat(ids, ',')), 13, vec2(12, 74), yel)
 end
@@ -570,6 +638,13 @@ function script.drawUI()
     end
     if debugOn then drawDebug() end
     if not isActive() then return end
+    if penNote and uiTime < penNote.untilT then
+      local k0, w, h = win.y / 1080, 640, 130
+      local x0, y0 = win.x / 2 - w * k0 / 2, win.y * 0.3
+      ui.drawRectFilled(vec2(x0, y0), vec2(x0 + w * k0, y0 + h * k0), RED, 12 * k0)
+      centered(penNote.title, 40 * k0, win.x / 2, y0 + 12 * k0, rgbm(1, 1, 1, 1))
+      centered(penNote.why, 22 * k0, win.x / 2, y0 + 78 * k0, rgbm(1, 1, 0.7, 1))
+    end
     local showGreen = S.phase == GREEN and S.seq > 0 and clock() - S.tStart < 5000
     if S.phase == GREEN and not showGreen then return end
 
@@ -608,7 +683,7 @@ function script.draw3D()
   guard(drawPaceCar)()
 end
 
-pcall(function() ac.log(string.format('Oval: %s loaded, CSP %s, me=%d cars=%d raceType=%s clock=%s events=%s', VERSION, tostring(build), ac.getCar(0).sessionID, sim.carsCount, tostring(sessionType()), tostring(clock()), tostring(sendEvent ~= nil))) end)
+pcall(function() ac.log(string.format('Oval: %s loaded, CSP %s, me=%d cars=%d raceType=%s clock=%s events=%s penalty=%s', VERSION, tostring(build), ac.getCar(0).sessionID, sim.carsCount, tostring(sessionType()), tostring(clock()), tostring(sendEvent ~= nil), cfg.penalty)) end)
 
 -- Offline tests load this file with a fake `ac` and read the internals from here.
-if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, stats = function() return stats end } end
+if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, pen = function() return pen end, note = function() return penNote end, stats = function() return stats end } end
