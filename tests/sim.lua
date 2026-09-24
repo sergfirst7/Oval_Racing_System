@@ -9,10 +9,25 @@ local GREEN, CAUTION, ONE_TO_GO = 0, 1, 2
 local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
-local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {} } -- t in seconds
-local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0 end
+local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {}, logs = {}, oldApi = {} } -- t in seconds
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0, false, 'ok' end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
+local V = {}
+V.__index = V
+local function vec3(x, y, z) return setmetatable({ x = x or 0, y = y or 0, z = z or 0 }, V) end
+V.__add = function(a, b) return vec3(a.x + b.x, a.y + b.y, a.z + b.z) end
+V.__sub = function(a, b) return vec3(a.x - b.x, a.y - b.y, a.z - b.z) end
+V.__mul = function(a, k) if type(a) == 'number' then a, k = k, a end return vec3(a.x * k, a.y * k, a.z * k) end
+function V:clone() return vec3(self.x, self.y, self.z) end
+function V:normalize() local l = math.sqrt(self.x ^ 2 + self.y ^ 2 + self.z ^ 2); self.x, self.y, self.z = self.x / l, self.y / l, self.z / l; return self end
+function V:cross(o) local x, y, z = self.y * o.z - self.z * o.y, self.z * o.x - self.x * o.z, self.x * o.y - self.y * o.x; self.x, self.y, self.z = x, y, z; return self end
+local function dot(a, b) return a.x * b.x + a.y * b.y + a.z * b.z end
+local R = TRACK / (2 * math.pi)
+local function roadPoint(v) -- track coordinates -> world: a circle, x is the distance to the right (outwards)
+  local a = 2 * math.pi * v.z
+  return vec3((R + v.x * 10) * math.cos(a), v.y, (R + v.x * 10) * math.sin(a))
+end
 local dummy
 dummy = setmetatable({}, { __index = function() return dummy end, __call = function() return dummy end, __add = function() return dummy end })
 local function noop() end
@@ -47,10 +62,11 @@ local function newEnv(client, cfgOverride)
     SessionType = { Race = 3 },
     StructItem = StructItem,
     onSessionStart = noop,
+    getSession = function() return { type = W.sessionType or 3 } end,
+    onChatMessage = function(cb) client.incoming = cb end,
     onOutgoingChatMessage = function(cb) client.chat = cb end,
     getDriverName = function(i) return 'car' .. i end,
-    trackCoordinateToWorld = function() return dummy end,
-    log = function(m) if tostring(m):find('rror') or tostring(m):find('unavailable') then W.errors[#W.errors + 1] = tostring(m) end end,
+    log = function(m) m = tostring(m); W.logs[#W.logs + 1] = m; if m:find('rror') then W.errors[#W.errors + 1] = m end end,
     onCarCollision = function(_, cb) client.hitcb = cb end,
     OnlineEvent = function(_, cb)
       local buf = { order = {} }
@@ -71,9 +87,46 @@ local function newEnv(client, cfgOverride)
       return send, function() return buf end
     end,
   }
-  local uiStub = setmetatable({ windowSize = function() return { x = 1920, y = 1080 } end, measureDWriteText = function() return { x = 100, y = 20 } end },
+  for k in pairs(W.oldApi) do env.ac[k] = nil end -- pretend to be a CSP that lacks these functions
+  if W.oldApi.structArray then StructItem.array = nil end
+  client.texts = {}
+  local gfx = { loads = {}, lights = {}, meshes = {} }
+  client.gfx = gfx
+  local function node()
+    local n = {}
+    function n:setVisible(v) self.visible = v; return self end
+    function n:setPosition(p) self.pos = p; return self end
+    function n:setOrientation(look, up) self.look, self.up = look, up; return self end
+    function n:loadKN5Async(path, cb) gfx.loads[#gfx.loads + 1] = path; if W.modelFails then cb('no such file') else
+      cb(nil, { findMeshes = function(_, name)
+        local m = gfx.meshes[name]
+        if not m then
+          m = { name = name, emissive = { r = 0 } }
+          function m:ensureUniqueMaterials() self.unique = true; return self end
+          function m:setMaterialProperty(prop, v) self.prop, self.emissive = prop, v; return self end
+          gfx.meshes[name] = m
+        end
+        return m
+      end })
+    end end
+    return n
+  end
+  env.ac.findNodes = function() return { createBoundingSphereNode = function() gfx.node = node(); return gfx.node end } end
+  env.ac.LightType = { Regular = 1 }
+  env.ac.LightSource = function() local l = { color = { r = 0 } }; gfx.lights[#gfx.lights + 1] = l; return l end
+  env.ac.trackCoordinateToWorld = roadPoint
+  env.physics = { raycastTrack = function(pos, _, _, hit, normal) -- the asphalt lies 1 m below the height of the spline
+    if W.ray == 'error' then error('physics not available') end
+    if W.ray == 'miss' then return -1 end
+    hit.x, hit.y, hit.z = pos.x, -1, pos.z
+    normal.x, normal.y, normal.z = 0, 1, 0
+    return pos.y + 1
+  end }
+  env.render = setmetatable({ calls = {}, BlendMode = { BlendAdd = 4, AlphaBlend = 1 } }, { __index = function(tt, k) return function() tt.calls[k] = (tt.calls[k] or 0) + 1 end end })
+  local uiStub = setmetatable({ dwriteDrawText = function(text) client.texts[#client.texts + 1] = tostring(text) end, windowSize = function() return { x = 1920, y = 1080 } end, measureDWriteText = function() return { x = 100, y = 20 } end },
     { __index = function() return noop end })
-  env.ui, env.render, env.vec2, env.vec3, env.rgbm = uiStub, dummy, dummy, dummy, dummy
+  env.ui, env.vec2, env.vec3, env.rgbm = uiStub, dummy, vec3, dummy
+  env.rgb = function(r, g, b) return { r = r, g = g, b = b } end
   return env
 end
 
@@ -159,7 +212,7 @@ local function step()
   end
   table.sort(W.cars, function(a, b) return a.lapCount + a.splinePosition > b.lapCount + b.splinePosition end)
   for i, c in ipairs(W.cars) do c.racePosition = i end
-  for _, cl in ipairs(W.clients) do if cl.connected then cl.env.script.update(DT); cl.env.script.drawUI(); cl.env.script.draw3D() end end
+  for _, cl in ipairs(W.clients) do if cl.connected then cl.texts = {}; cl.env.script.update(DT); cl.env.script.drawUI(); cl.env.script.draw3D() end end
 end
 
 local function run(sec) for _ = 1, math.floor(sec / DT) do step() end end
@@ -217,6 +270,14 @@ local function scenarioManual()
   local admin = 5
   run(10)
   check(W.clients[1].oval.state().phase == GREEN, 'starts green')
+  local known = true
+  for _, cl in ipairs(W.clients) do
+    local n = 0
+    for _ in pairs(cl.oval.presence()) do n = n + 1 end
+    known = known and n == 9
+  end
+  check(known, 'every client has heard from all nine script users (the greetings)')
+  check(W.clients[2].oval.stats().sent >= 1 and W.clients[2].oval.stats().got >= 9, 'and counts what it sent and received')
   check(W.clients[admin].chat('!yellow') == true, 'admin !yellow is handled (kept out of chat)')
   check(W.clients[1].chat('!yellow') == false, 'non-admin !yellow is left alone')
   run(1)
@@ -504,6 +565,148 @@ local function scenarioLeaderless()
   check(W.t - at < 150, 'the flag turns green by itself after 1.5 laps (' .. string.format('%.0f', W.t - at) .. ' s)')
 end
 
+local function scenarioModel()
+  print('== pace car model: its own light bar flashes, it stands on the asphalt')
+  field(6, 45, 200, nil, 1)
+  run(5)
+  check(#W.clients[2].gfx.loads == 0, 'nothing is loaded while the race is green')
+  W.clients[1].chat('!yellow')
+  run(0.5)
+  local gfx, ov = W.clients[2].gfx, W.clients[2].oval
+  check(#gfx.loads == 1 and gfx.loads[1]:find('aston_vantage2018.kn5', 1, true), 'the Aston Martin model is loaded once, when the first pace car appears')
+  check(gfx.node.visible == true, 'and shown')
+  local A, B = gfx.meshes['g_safety_red'], gfx.meshes['g_safety_yellow']
+  check(A and B and A.unique and B.unique and A ~= B, 'the two lenses of the model own light bar are found and get materials of their own')
+  local seenA, seenB, dark, both, worst = false, false, false, false, { up = 1, fwd = 1, pos = 0, y = 0 }
+  local lightsFollow = true
+  for _ = 1, math.floor(3 / DT) do
+    step()
+    local a1, b1 = A.emissive.r > 1, B.emissive.r > 1
+    seenA, seenB, dark, both = seenA or (a1 and not b1), seenB or (b1 and not a1), dark or (not a1 and not b1), both or (a1 and b1)
+    lightsFollow = lightsFollow and ((gfx.lights[1].color.r > 0) == a1) and ((gfx.lights[2].color.r > 0) == b1)
+    local n, s = gfx.node, ov.pacePos()
+    local want = roadPoint(vec3(0, 0, s))
+    local a2 = 2 * math.pi * s
+    local tangent = vec3(-math.sin(a2), 0, math.cos(a2))
+    worst.pos = math.max(worst.pos, math.abs(n.pos.x - want.x) + math.abs(n.pos.z - want.z))
+    worst.y = math.max(worst.y, math.abs(n.pos.y - (-1)))
+    worst.up = math.min(worst.up, n.up.y)
+    worst.fwd = math.min(worst.fwd, dot(n.look, tangent))
+  end
+  check(worst.pos < 1e-6, 'the model stands on the synced pace car position')
+  check(worst.y < 1e-9, 'and on the asphalt found by the ray, not at the spline height (1 m above it here)')
+  check(worst.up > 0.999 and worst.fwd > 0.999, 'it points along the road and stands upright (up ' .. string.format('%.4f', worst.up) .. ', forward ' .. string.format('%.4f', worst.fwd) .. ')')
+  check(seenA and seenB and dark and not both, 'the two lenses flash in turns and are dark in between, never both at once')
+  check(lightsFollow, 'the light sources glow exactly when their lens does')
+  check((W.clients[2].env.render.calls.rectangle or 0) == 0, 'no glow squares are drawn any more')
+  check(#gfx.loads == 1, 'the model was not loaded again')
+  W.clients[1].chat('!green')
+  run(1)
+  check(gfx.node.visible == false and A.emissive.r == 0 and B.emissive.r == 0 and gfx.lights[1].color.r == 0 and gfx.lights[2].color.r == 0, 'model hidden, lenses and lights dark on green')
+
+  for _, mode in ipairs({ 'miss', 'error' }) do
+    print('== the ground ray ' .. (mode == 'miss' and 'hits nothing' or 'is not available'))
+    field(6, 45, 200, nil, 1)
+    W.ray = mode
+    run(5)
+    W.clients[1].chat('!yellow')
+    run(2)
+    check(math.abs(W.clients[2].gfx.node.pos.y) < 1e-9, 'the model falls back to the spline height')
+  end
+  W.ray = 'ok'
+
+  print('== the model cannot be loaded')
+  field(6, 45, 200, nil, 1)
+  W.modelFails = true
+  run(5)
+  W.clients[1].chat('!yellow')
+  run(3)
+  local c = W.clients[2]
+  check(#c.gfx.loads == 1 and (c.env.render.calls.debugArrow or 0) > 10, 'one attempt, then the arrow marker')
+  W.modelFails = false
+
+  print('== the model is switched off')
+  field(6, 45, 200, { paceModel = '' }, 1)
+  run(5)
+  W.clients[1].chat('!yellow')
+  run(3)
+  check(#W.clients[2].gfx.loads == 0 and (W.clients[2].env.render.calls.debugArrow or 0) > 10, 'paceModel = empty: no model, arrow only')
+end
+
+local function scenarioOldCsp()
+  print('== an old CSP that lacks some functions')
+  W.oldApi = { onOutgoingChatMessage = true, onSessionStart = true, configValues = true, getPatchVersionCode = true, onCarCollision = true }
+  local byId = field(6, 45, 200)
+  W.oldApi = {}
+  local before = #W.logs
+  run(30)
+  byId[3].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  check(W.clients[1].oval.state().cause == 3 and #W.errors == 0, 'the script loads and works, only the missing features are gone')
+  local said = table.concat(W.logs, ' ', 1, #W.logs)
+  check(said:find('chat commands unavailable', 1, true) and said:find('session start events unavailable', 1, true), 'and the log says which ones')
+  check(W.clients[1].chat == nil, 'no chat commands then')
+  check(W.clients[1].oval.local1() ~= nil, 'the rules still run')
+
+  print('== old CSP: commands come back through the incoming chat')
+  W.oldApi = { onOutgoingChatMessage = true }
+  field(4, 45, 200, nil, 2)
+  W.oldApi = {}
+  run(5)
+  W.clients[2].incoming('!yellow', 3)
+  W.clients[1].incoming('!yellow', 0)
+  run(1)
+  everyone(GREEN, 'a message of another player, or of a player who is no admin, is no command')
+  W.clients[2].incoming('!yellow', 0)
+  run(1)
+  check(W.clients[1].oval.state().phase == CAUTION, 'the admin\'s own message coming back calls the caution')
+
+  print('== old CSP: no arrays in the event layout')
+  W.oldApi = { structArray = true }
+  field(4, 45, 200)
+  W.oldApi = {}
+  run(2)
+  local warned2 = false
+  for _, tx in ipairs(W.clients[1].texts) do warned2 = warned2 or tx:find('no online events', 1, true) ~= nil end
+  check(warned2 and #W.errors == 0, 'the script loads, tells the player, and does not fail')
+
+  print('== old CSP: the session type comes from the session')
+  local old = field(4, 45, 200)
+  for _, cl in ipairs(W.clients) do cl.sim.raceSessionType = nil end
+  run(30)
+  old[2].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  check(true, 'a race is recognised without sim.raceSessionType')
+  W.sessionType = 2
+  old = field(4, 45, 200)
+  for _, cl in ipairs(W.clients) do cl.sim.raceSessionType = nil end
+  run(30)
+  old[2].stopped = true
+  run(20)
+  everyone(GREEN, 'and qualifying is recognised as well')
+  W.sessionType = nil
+
+  print('== an error is shown on the screen')
+  local cl = W.clients[1]
+  cl.sim.carsCount = 'boom'
+  cl.env.script.update(DT)
+  cl.texts = {}
+  cl.env.script.drawUI()
+  local shown = false
+  for _, tx in ipairs(cl.texts) do shown = shown or tx:find('OVAL error', 1, true) ~= nil end
+  check(shown, 'the player and whoever looks at his screen can read what failed')
+  W.errors = {} -- that error was on purpose
+
+  print('== no online events at all')
+  W.oldApi = { OnlineEvent = true }
+  field(4, 45, 200)
+  W.oldApi = {}
+  run(2)
+  local warned = false
+  for _, tx in ipairs(W.clients[1].texts) do warned = warned or tx:find('no online events', 1, true) ~= nil end
+  check(warned, 'the player is told that the flag cannot reach him')
+end
+
 local function scenarioNoScript()
   print('== the lowest session id has no script')
   local byId = field(8, 45, 200, nil, nil, { [1] = true })
@@ -511,6 +714,8 @@ local function scenarioNoScript()
   byId[4].stopped = true
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
   check(W.clients[1].oval.state().from == 4, 'the caution comes although the controller-to-be runs nothing')
+  local pr = W.clients[1].oval.presence()
+  check(pr[1] == nil and pr[2] and pr[8], 'the client without the script is not on the list of script users')
   byId[4].isInPitlane = true
   byId[6].isInPitlane = true
   run(6)
@@ -524,11 +729,13 @@ end
 
 scenarioManual()
 scenarioWreck()
+scenarioModel()
 scenarioGrid()
 scenarioRolling(true)
 scenarioRolling(false)
 scenarioNotARace()
 scenarioLeaderless()
+scenarioOldCsp()
 scenarioNoScript()
 scenarioAuto()
 scenarioGiveUp()

@@ -2,11 +2,11 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 8.5'
+local VERSION = 'Oval 8.8'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
-local cfg = ac.configValues({
+local cfgDefaults = {
   paceKmh = 100,       -- pace car speed
   speedTolKmh = 8,     -- speed above the limit that still counts as fine
   catchupKmh = 60,     -- extra speed allowed while closing a big gap to the car ahead
@@ -25,13 +25,28 @@ local cfg = ac.configValues({
   cautionLaps = 1,     -- pace laps before the field may be sent back to green
   maxCautionLaps = 4,  -- restart anyway after this many pace laps
   oneToGoAt = 0.75,    -- the pace car leaves in the last quarter of a lap (track position 0..1), green at the line
+  paceModel = 'content/cars/aston_vantage2018/aston_vantage2018.kn5', -- 3D model of the pace car, '' for the arrow marker only
+  paceFlip = 0,        -- 1: turn the model around if it drives backwards
+  paceLightA = 'g_safety_red',    -- meshes of the model's own light bar that flash (the first one, then...
+  paceLightB = 'g_safety_yellow', -- ...the second one)
   everySession = 0,    -- 1: run in every session, not only in races (testing)
   debug = 0,           -- 1: show the debug panel (chat command !ovaldebug toggles it for you)
-})
+}
+local okCfg, cfgRead = pcall(ac.configValues, cfgDefaults)
+local cfg = okCfg and cfgRead or cfgDefaults
 
 local GREEN, CAUTION, ONE_TO_GO = 0, 1, 2
 local NONE, ORDER_MAX, STOP_KMH, RANK_DELAY = 255, 48, 25, 0.4
 local TITLES = { [0] = 'CAUTION', [1] = 'CAUTION - CAR STOPPED', [2] = 'ROLLING START', [3] = 'CAUTION - WRECK' }
+
+local function try(what, fn, ...) -- a missing feature costs that feature, not the whole script
+  local good, err = pcall(fn, ...)
+  if not good then ac.log('Oval: ' .. what .. ' unavailable: ' .. tostring(err)) end
+  return good
+end
+local RACE = ac.SessionType and ac.SessionType.Race or 3
+local okBuild, build = pcall(ac.getPatchVersionCode)
+build = okBuild and build or '?'
 
 local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
@@ -42,7 +57,7 @@ local function activeCars() -- sessionID -> car
   local m = {}
   for i = 0, sim.carsCount - 1 do
     local c = ac.getCar(i)
-    if c and c.isConnected and c.isActive then m[c.sessionID] = c end
+    if c and c.isConnected and c.isActive ~= false then m[c.sessionID] = c end
   end
   return m
 end
@@ -52,7 +67,7 @@ end
 local function freshState() return { seq = 0, from = NONE, phase = GREEN, reason = 0, cause = NONE, tStart = 0, s0 = 0, kmh = 0, order = {} } end
 local S = freshState()
 local L1, watch, ctl = {}, {}, {} -- rules of the local car / incident watch of the local car / restart bookkeeping
-local uiTime, lastClock, lastError, hudCars, hudRank, debugOn = 0, 0, nil, {}, 0, cfg.debug == 1
+local uiTime, lastClock, lastError, hudCars, hudRank, debugOn, greeted = 0, 0, nil, {}, 0, cfg.debug == 1, false
 
 local function adopt(new) -- local state survives order updates of the same deployment
   if new.phase ~= S.phase or new.tStart ~= S.tStart then L1, watch, ctl = {}, {}, {} end
@@ -63,44 +78,64 @@ local function adopt(new) -- local state survives order updates of the same depl
 end
 
 local sendEvent, accessEvent, outbox
+local presence, stats = {}, { sent = 0, got = 0, stale = 0 } -- clients that run the script, message counters
 local function onState(sender, d)
   if not sender then return end -- only clients talk to us
   local from = sender.sessionID
+  stats.got = stats.got + 1
+  if not presence[from] then
+    presence[from] = true
+    ac.log(string.format('Oval: script seen on client %d (seq=%d)', from, d.seq))
+  end
+  if d.seq == 0 then return end -- a greeting, not a state
   if d.seq < S.seq or (d.seq == S.seq and from >= S.from) then return end -- older, or our own echo
-  if d.tStart > clock() + 3000 then return end -- stale message from a previous session
+  if d.tStart > clock() + 3000 then -- stale message from a previous session
+    stats.stale = stats.stale + 1
+    ac.log(string.format('Oval: ignored a stale message seq=%d from=%d tStart=%d clock=%d', d.seq, from, d.tStart, math.floor(clock())))
+    return
+  end
   local order = {}
   for i = 0, math.min(d.n, ORDER_MAX) - 1 do order[#order + 1] = d.order[i] end
   adopt({ seq = d.seq, from = from, phase = d.phase, reason = d.reason, cause = d.cause, tStart = d.tStart, s0 = d.s0, kmh = d.kmh, order = order })
 end
 
-local ok, s, a = pcall(ac.OnlineEvent, {
-  ac.StructItem.key('ovalState8'),
-  seq = ac.StructItem.int32(),
-  tStart = ac.StructItem.int32(),
-  s0 = ac.StructItem.float(),
-  kmh = ac.StructItem.uint16(),
-  phase = ac.StructItem.uint8(),
-  reason = ac.StructItem.uint8(),
-  cause = ac.StructItem.uint8(),
-  n = ac.StructItem.uint8(),
-  order = ac.StructItem.array(ac.StructItem.uint8(), ORDER_MAX),
-}, onState)
+local ok, s, a = pcall(function()
+  return ac.OnlineEvent({
+    ac.StructItem.key('ovalState8'),
+    seq = ac.StructItem.int32(),
+    tStart = ac.StructItem.int32(),
+    s0 = ac.StructItem.float(),
+    kmh = ac.StructItem.uint16(),
+    phase = ac.StructItem.uint8(),
+    reason = ac.StructItem.uint8(),
+    cause = ac.StructItem.uint8(),
+    n = ac.StructItem.uint8(),
+    order = ac.StructItem.array(ac.StructItem.uint8(), ORDER_MAX),
+  }, onState)
+end)
 if ok then sendEvent, accessEvent = s, a else ac.log('Oval: online events unavailable: ' .. tostring(s)) end
+
+-- Puts a message into the shared buffer and queues it for everybody else.
+local outboxAt
+local function queue(seq, tStart, s0, kmh, phase, reason, cause, order)
+  if not accessEvent then return end
+  local p = accessEvent() -- fill every field: the buffer is reused
+  p.seq, p.tStart, p.s0, p.kmh, p.phase, p.reason, p.cause, p.n = seq, tStart, s0, kmh, phase, reason, cause, #order
+  for i = 0, ORDER_MAX - 1 do p.order[i] = order[i + 1] or NONE end
+  outbox, outboxAt = true, outboxAt or uiTime
+end
 
 -- Makes a new state current here and queues it for everybody else.
 local function commit(phase, reason, cause, tStart, s0, order)
   adopt({ seq = S.seq + 1, from = ac.getCar(0).sessionID, phase = phase, reason = reason, cause = cause, tStart = math.floor(tStart), s0 = s0, kmh = cfg.paceKmh, order = order })
-  if not accessEvent then return end
-  local p = accessEvent() -- fill every field: the buffer is reused
-  p.seq, p.tStart, p.s0, p.kmh, p.phase, p.reason, p.cause, p.n = S.seq, S.tStart, s0, S.kmh, phase, reason, cause, #order
-  for i = 0, ORDER_MAX - 1 do p.order[i] = order[i + 1] or NONE end
-  outbox = true
+  queue(S.seq, S.tStart, s0, S.kmh, phase, reason, cause, order)
 end
 
 local function pacePos() return frac(S.s0 + S.kmh / 3.6 * (clock() - S.tStart) / 1000 / trackLen()) end
 
 local function ahead(a, b) -- is car a ahead of car b in the race
-  if a.racePosition > 0 and b.racePosition > 0 and a.racePosition ~= b.racePosition then return a.racePosition < b.racePosition end
+  local pa, pb = a.racePosition or 0, b.racePosition or 0
+  if pa > 0 and pb > 0 and pa ~= pb then return pa < pb end
   if S.seq == 0 and a.lapCount == 0 and b.lapCount == 0 then return frac(-a.splinePosition) < frac(-b.splinePosition) end -- on the grid: closest before the line
   return a.lapCount + a.splinePosition > b.lapCount + b.splinePosition
 end
@@ -314,19 +349,29 @@ local function guard(fn)
   end
 end
 
-local function isActive() return cfg.everySession == 1 or sim.raceSessionType == ac.SessionType.Race end
-local function reset() S, L1, watch, ctl, start = freshState(), {}, {}, {}, {} end
-ac.onSessionStart(reset)
+local function sessionType()
+  local t = sim.raceSessionType
+  if t ~= nil then return t end
+  local good, sess = pcall(ac.getSession, sim.currentSessionIndex) -- older CSP: ask the session itself
+  return good and sess and sess.type or nil
+end
+local function isActive() return cfg.everySession == 1 or sessionType() == RACE end
+local function reset() S, L1, watch, ctl, start, greeted = freshState(), {}, {}, {}, {}, false end
+try('session start events', ac.onSessionStart, reset)
 
 -- Chat commands: !ovaldebug (anyone, only for yourself), !yellow / !green (admin)
-ac.onOutgoingChatMessage(function(msg)
+local function command(msg)
   local cmd = msg:lower():match('^%s*!(%a+)%s*$')
   if cmd == 'ovaldebug' then debugOn = not debugOn return true end
   if (cmd ~= 'yellow' and cmd ~= 'green') or not isActive() then return false end
   if sim.isOnlineRace and not sim.isAdmin then return false end
   if cmd == 'yellow' then deploy(0, NONE) else release() end
   return true
-end)
+end
+if not try('chat commands', ac.onOutgoingChatMessage, command) then
+  -- older CSP cannot intercept what we type: react to our own message when it comes back (it stays visible in the chat)
+  try('chat commands from the incoming chat', ac.onChatMessage, function(msg, sender) if sender == 0 then command(msg) end end)
+end
 
 -- The session clock starts at 0 when the session is created, 30 s before the lights go out, so it
 -- says nothing about the start. Signals: the countdown of the game (timeToSessionStart) has run
@@ -350,12 +395,116 @@ local function startRace(cars, rank, now) -- lights out: the field follows the p
   if S.seq > 0 then start.done = true end
   if cfg.rolling ~= 1 or start.done or not lightsOut(cars, now) or not due('start', rank) then return end
   local list = {}
-  for id, c in pairs(cars) do list[#list + 1] = string.format('%d:p%d:%.4f', id, c.racePosition, c.splinePosition) end
+  for id, c in pairs(cars) do list[#list + 1] = string.format('%d:p%d:%.4f', id, c.racePosition or 0, c.splinePosition) end
   deploy(2, NONE)
   if S.seq > 0 then
     start.done = true
     ac.log(string.format('Oval: lights out (tts=%s clock=%d), rolling start, grid %s', tostring(sim.timeToSessionStart), math.floor(now), table.concat(list, ' ')))
   end
+end
+
+-- ── the pace car on the road ─────────────────────────────────────────────────
+-- A car model from the game folder is put on the track every frame at the synced position. The
+-- model has its own light bar (safety car): its lenses flash by their own emissive, and two light
+-- sources light up the surroundings. Anything that fails leaves the arrow.
+local car3d = { state = 'idle' } -- idle / loading / ready / failed
+local YELLOW = rgbm(1, 0.82, 0, 0.95)
+local RED_ON, AMBER_ON, DARK = rgb(14, 0.6, 0), rgb(14, 7, 0), rgb(0, 0, 0)
+local BAR = { 0, 1.45, -1.08 } -- centre of the light bar in the model (right, up, forward), read from the model file
+
+local function loadPaceCar()
+  car3d.state = 'loading'
+  local root = ac.findNodes('carsRoot:yes'):createBoundingSphereNode('OvalPaceCar', 8)
+  if not root then car3d.state = 'failed' return end
+  root:setVisible(false)
+  root:loadKN5Async(cfg.paceModel, function(err, model)
+    guard(function()
+      if not model then
+        car3d.state = 'failed'
+        ac.log('Oval: pace car model failed: ' .. tostring(err))
+        return
+      end
+      -- each lens gets its own material, the two of them share one in the model
+      car3d.lensA = model:findMeshes(cfg.paceLightA):ensureUniqueMaterials()
+      car3d.lensB = model:findMeshes(cfg.paceLightB):ensureUniqueMaterials()
+      car3d.lights = {}
+      for i = 1, 2 do
+        local l = ac.LightSource(ac.LightType.Regular)
+        l.range, l.color = 14, DARK
+        car3d.lights[i] = l
+      end
+      car3d.root, car3d.state = root, 'ready'
+      ac.log('Oval: pace car model loaded: ' .. cfg.paceModel)
+    end)()
+  end)
+end
+
+-- position on the road, the direction of travel, the way up (follows banking) and to the right
+local function roadFrame(s)
+  local len = trackLen()
+  local p = ac.trackCoordinateToWorld(vec3(0, 0, s))
+  local fwd = (ac.trackCoordinateToWorld(vec3(0, 0, frac(s + 4 / len))) - p):normalize()
+  local side = (ac.trackCoordinateToWorld(vec3(1, 0, s)) - ac.trackCoordinateToWorld(vec3(-1, 0, s))):normalize()
+  local up = side:clone():cross(fwd):normalize()
+  if up.y < 0 then up = up * -1 end
+  return p, fwd, up, side
+end
+
+-- The height along the spline is not always the height of the asphalt (banking!): ask the physics
+-- of the track for the real surface under that point, the spline is the fallback.
+local function groundedFrame(s)
+  local p, fwd, up, side = roadFrame(s)
+  local hit, normal = vec3(0, 0, 0), vec3(0, 0, 0)
+  local ok, dist = pcall(function() return physics.raycastTrack(p + vec3(0, 4, 0), vec3(0, -1, 0), 12, hit, normal) end)
+  if ok and dist and dist > 0 then
+    p = hit
+    if normal.y > 0.5 then up = normal:clone():normalize() end
+  elseif not car3d.rayLogged then
+    car3d.rayLogged = true
+    ac.log('Oval: no ground ray (' .. tostring(dist) .. '), the pace car follows the spline height')
+  end
+  return p, fwd, up, side
+end
+
+local function setLens(lens, key, on, color)
+  if car3d[key] == on then return end
+  car3d[key] = on
+  lens:setMaterialProperty('ksEmissive', on and color or DARK)
+end
+
+local function updatePaceCar()
+  local show = S.phase == CAUTION and isActive()
+  if show and car3d.state == 'idle' and cfg.paceModel ~= '' then loadPaceCar() end
+  if car3d.state ~= 'ready' then return end
+  if car3d.visible ~= show then car3d.visible = show; car3d.root:setVisible(show) end
+
+  local onA, onB = false, false
+  if show then
+    local p, fwd, up, side = groundedFrame(pacePos())
+    local mf = cfg.paceFlip == 1 and -1 or 1 -- the model's forward relative to the travel direction
+    car3d.root:setPosition(p):setOrientation(fwd * mf, up)
+    car3d.frame = { p = p, up = up }
+    local step = math.floor(uiTime * 10) % 6 -- double flash: the first lens, then the second, dark in between
+    onA, onB = step == 0 or step == 2, step == 3 or step == 5
+    local bar = p + side * BAR[1] + up * BAR[2] + fwd * (BAR[3] * mf)
+    car3d.lights[1].position, car3d.lights[2].position = bar, bar
+  end
+  setLens(car3d.lensA, 'onA', onA, RED_ON)
+  setLens(car3d.lensB, 'onB', onB, AMBER_ON)
+  car3d.lights[1].color = onA and rgb(9, 0.4, 0) or DARK
+  car3d.lights[2].color = onB and rgb(9, 4.5, 0) or DARK
+end
+
+local function drawPaceCar()
+  if S.phase ~= CAUTION or not isActive() then return end
+  if car3d.state ~= 'ready' then -- no model: an arrow and a label
+    local p = ac.trackCoordinateToWorld(vec3(0, 0, pacePos()))
+    render.debugArrow(p + vec3(0, 14, 0), p + vec3(0, 2, 0), 1.5, YELLOW)
+    render.debugText(p + vec3(0, 16, 0), 'PACE CAR', YELLOW, 2)
+    return
+  end
+  local f = car3d.frame
+  if f then render.debugText(f.p + f.up * 3.6, 'PACE CAR', YELLOW, 1.5) end
 end
 
 function script.update(dt)
@@ -364,7 +513,18 @@ function script.update(dt)
     local now = clock()
     if now < lastClock - 5000 then reset() end -- session restarted
     lastClock = now
-    if outbox and sendEvent and sendEvent(nil, true) then outbox = false end -- rate limited, retried next frame
+    if not greeted and accessEvent and uiTime > 1 and S.seq == 0 then -- tell the others that this client runs the script
+      greeted = true
+      queue(0, 0, 0, 0, GREEN, 0, NONE, {})
+    end
+    if outbox and sendEvent then
+      if sendEvent(nil, true) then -- rate limited: retried next frame
+        outbox, outboxAt, stats.sent, stats.warned = false, nil, stats.sent + 1, false
+      elseif outboxAt and uiTime - outboxAt > 5 and not stats.warned then
+        stats.warned = true
+        ac.log('Oval: a message has not gone out for 5 s (rate limit, or the server does not pass client messages)')
+      end
+    end
     if not isActive() then if S.seq > 0 then reset() end return end
 
     local cars, me = activeCars(), ac.getCar(0)
@@ -374,11 +534,12 @@ function script.update(dt)
     if S.phase == GREEN then startRace(cars, rank, now); watchSelf(dt, now) end
     control(cars, dt, rank)
     localCheck(cars)
+    updatePaceCar()
   end)()
 end
 
 -- ── HUD ──────────────────────────────────────────────────────────────────────
-local YELLOW, GREENC, RED, BLACK = rgbm(1, 0.82, 0, 0.95), rgbm(0.1, 0.75, 0.2, 0.95), rgbm(0.9, 0.1, 0.1, 0.95), rgbm(0, 0, 0, 1)
+local GREENC, RED, BLACK = rgbm(0.1, 0.75, 0.2, 0.95), rgbm(0.9, 0.1, 0.1, 0.95), rgbm(0, 0, 0, 1)
 
 local function centered(text, size, cx, y, color)
   ui.dwriteDrawText(text, size, vec2(cx - ui.measureDWriteText(text, size).x / 2, y), color)
@@ -390,12 +551,23 @@ local function drawDebug()
   ui.dwriteDrawText(string.format('speed %d fast %s slow %.1f peak %d hit %s  rel %s allowed %s  %s', math.floor(c.speedKmh), tostring(watch.fast), watch.slow or 0, math.floor(watch.peak or 0),
     tostring(watch.hit ~= nil), L1.rel and math.floor(L1.rel) or '-', L1.allowed and math.floor(L1.allowed) or '-', lastError or ''), 13, vec2(12, 42), yel)
   ui.dwriteDrawText('order ' .. table.concat(S.order, ','), 13, vec2(12, 58), yel)
+  local ids = {}
+  for id in pairs(presence) do ids[#ids + 1] = id end
+  table.sort(ids)
+  ui.dwriteDrawText(string.format('CSP %s  race %s  direct %s  sent %d got %d stale %d  script on: %s', tostring(build), tostring(sessionType()), tostring(sim.directMessagingAvailable),
+    stats.sent, stats.got, stats.stale, table.concat(ids, ',')), 13, vec2(12, 74), yel)
 end
 
 function script.drawUI()
   guard(function()
     local win = ui.windowSize()
-    if uiTime < 8 then ui.dwriteDrawText(VERSION .. ' loaded', 14, vec2(12, 8), rgbm(1, 1, 1, 0.8)) end
+    if uiTime < 20 then ui.dwriteDrawText(string.format('%s loaded (CSP %s)', VERSION, tostring(build)), 14, vec2(12, 8), rgbm(1, 1, 1, 0.8)) end
+    if lastError then
+      ui.dwriteDrawText(('OVAL error: ' .. tostring(lastError)):sub(1, 200), 14, vec2(12, 48), rgbm(1, 0.3, 0.3, 1))
+    end
+    if not sendEvent and isActive() then
+      ui.dwriteDrawText('OVAL: no online events, the flag will not reach you. Update Custom Shaders Patch.', 16, vec2(12, 30), rgbm(1, 0.3, 0.3, 1))
+    end
     if debugOn then drawDebug() end
     if not isActive() then return end
     local showGreen = S.phase == GREEN and S.seq > 0 and clock() - S.tStart < 5000
@@ -433,15 +605,10 @@ function script.drawUI()
 end
 
 function script.draw3D()
-  guard(function()
-    if S.phase ~= CAUTION or not isActive() then return end
-    local p = ac.trackCoordinateToWorld(vec3(0, 0, pacePos()))
-    render.debugArrow(p + vec3(0, 14, 0), p + vec3(0, 2, 0), 1.5, YELLOW)
-    render.debugText(p + vec3(0, 16, 0), 'PACE CAR', YELLOW, 2)
-  end)()
+  guard(drawPaceCar)()
 end
 
-pcall(function() ac.log(string.format('Oval: %s loaded, me=%d cars=%d raceType=%s clock=%s', VERSION, ac.getCar(0).sessionID, sim.carsCount, tostring(sim.raceSessionType), tostring(clock()))) end)
+pcall(function() ac.log(string.format('Oval: %s loaded, CSP %s, me=%d cars=%d raceType=%s clock=%s events=%s', VERSION, tostring(build), ac.getCar(0).sessionID, sim.carsCount, tostring(sessionType()), tostring(clock()), tostring(sendEvent ~= nil))) end)
 
 -- Offline tests load this file with a fake `ac` and read the internals from here.
-if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end } end
+if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, stats = function() return stats end } end
