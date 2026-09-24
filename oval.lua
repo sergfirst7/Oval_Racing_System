@@ -19,7 +19,7 @@ local cfgDefaults = {
   stopSec = 3,         -- how long a car must stay that slow to count as an incident
   raceKmh = 80,        -- a car only counts after it has been this fast since the last green
   cooldownSec = 4,     -- no automatic caution in the first seconds after a green flag
-  penalty = 'slow',    -- what breaking the pace rules costs: 'off' (warnings only), 'slow' (up to a gas cut), 'drive' (up to a drive-through: EXPERIMENTAL, see README)
+  penalty = 'drive',   -- what breaking the pace rules costs: 'off' (warnings only), 'slow' (up to a gas cut), 'drive' (up to a drive-through)
   graceSec = 6,        -- time to slow down after the pace car appears before violations count
   speedSec = 4,        -- being too fast for this long is a violation
   passSec = 1.2,       -- being ahead of the car in front for this long is a violation
@@ -195,7 +195,7 @@ local function penalize(why, weight)
   if cfg.penalty ~= 'off' and level >= 2 then
     if cfg.penalty == 'drive' and level >= 3 and not pen.owed and not pen.driving then
       -- Handed out only when the race is green again: a caution is over in about a lap, too soon
-      -- to serve it. Still unproven in the game (see watchGamePenalty), which is why 'drive' is opt-in.
+      -- to serve it. Verified in the game: it is served by a run through the pit lane.
       title, pen.owed = 'DRIVE-THROUGH AFTER THE GREEN', true
     elseif uiTime - (pen.slowAt or -100) < cfg.slowSec + 3 then
       title = 'GAS CUT (ALREADY ACTIVE)' -- a running gas cut is not extended

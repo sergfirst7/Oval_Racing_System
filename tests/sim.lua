@@ -734,8 +734,8 @@ local function speeder(cfg, admin)
 end
 
 local function scenarioPenalties()
-  print('== penalties: warning, gas cut, drive-through after the green flag (penalty = drive)')
-  local byId = speeder({ penalty = 'drive' })
+  print('== penalties (the defaults): warning, gas cut, drive-through after the green flag')
+  local byId = speeder()
   local y = W.t
   run(45)
   local me = W.clients[5]
@@ -791,8 +791,8 @@ local function scenarioPenalties()
   run(45)
   check(#W.clients[5].penalties == 0 and noteOf(W.clients[5]):find('WARNING', 1, true), 'nothing is applied to the car, the driver is only warned')
 
-  print('== the default: never more than a gas cut')
-  speeder()
+  print('== penalty = slow: never more than a gas cut')
+  speeder({ penalty = 'slow' })
   run(45)
   check(kinds(W.clients[5]):find('GasCut', 1, true) and not kinds(W.clients[5]):find('MandatoryPits', 1, true), 'only gas cuts (' .. kinds(W.clients[5]) .. ')')
 
