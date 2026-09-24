@@ -10,7 +10,7 @@ local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
 local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {}, logs = {}, oldApi = {} } -- t in seconds
-local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0, false, 'ok' end
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray, W.penaltyFails = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0, false, 'ok', false end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
 local V = {}
@@ -62,6 +62,8 @@ local function newEnv(client, cfgOverride)
     SessionType = { Race = 3 },
     StructItem = StructItem,
     onSessionStart = noop,
+    PenaltyType = { None = 0, MandatoryPits = 1, TeleportToPits = 2, SlowDown = 3, BlackFlag = 4 },
+    setMessage = function(title, why) client.messages[#client.messages + 1] = title .. ' / ' .. why end,
     getSession = function() return { type = W.sessionType or 3 } end,
     onChatMessage = function(cb) client.incoming = cb end,
     onOutgoingChatMessage = function(cb) client.chat = cb end,
@@ -89,7 +91,7 @@ local function newEnv(client, cfgOverride)
   }
   for k in pairs(W.oldApi) do env.ac[k] = nil end -- pretend to be a CSP that lacks these functions
   if W.oldApi.structArray then StructItem.array = nil end
-  client.texts = {}
+  client.texts, client.messages, client.penalties = {}, {}, {}
   local gfx = { loads = {}, lights = {}, meshes = {} }
   client.gfx = gfx
   local function node()
@@ -115,7 +117,11 @@ local function newEnv(client, cfgOverride)
   env.ac.LightType = { Regular = 1 }
   env.ac.LightSource = function() local l = { color = { r = 0 } }; gfx.lights[#gfx.lights + 1] = l; return l end
   env.ac.trackCoordinateToWorld = roadPoint
-  env.physics = { raycastTrack = function(pos, _, _, hit, normal) -- the asphalt lies 1 m below the height of the spline
+  env.physics = { setCarPenalty = function(kind, param)
+    if W.penaltyFails then error('physics not available') end
+    local name = kind == 1 and 'MandatoryPits' or kind == 3 and 'SlowDown' or tostring(kind)
+    client.penalties[#client.penalties + 1] = { kind = name, param = param, t = W.t }
+  end, raycastTrack = function(pos, _, _, hit, normal) -- the asphalt lies 1 m below the height of the spline
     if W.ray == 'error' then error('physics not available') end
     if W.ray == 'miss' then return -1 end
     hit.x, hit.y, hit.z = pos.x, -1, pos.z
@@ -165,7 +171,8 @@ local function disconnect(client) client.connected, client.car.isConnected, clie
 local function target(car, phase, pace, paceKmh)
   if car.stopped or (W.hold and W.t < 0) then return 0 end
   if phase == GREEN or car.ignore then return car.cruise end
-  if phase == ONE_TO_GO then return paceKmh - 4 end
+  if car.hold then return car.hold end
+  if phase == ONE_TO_GO then return paceKmh - 4 + (car.over or 0) end
   local gap, aheadKmh = TRACK, paceKmh
   for _, o in ipairs(W.cars) do
     if o ~= car and o.isConnected and not o.isInPitlane then
@@ -177,7 +184,7 @@ local function target(car, phase, pace, paceKmh)
   if g < gap then gap, aheadKmh = g, paceKmh end
   local t = paceKmh + W.catchup * clamp((gap - 30) / 120, 0, 1) - 4
   if gap < 20 then t = math.min(t, aheadKmh - 10) end
-  return t
+  return t + (car.over or 0)
 end
 
 local function step()
@@ -381,6 +388,7 @@ local function scenarioAuto()
   run(1)
   everyone(GREEN, 'is green')
   check(W.sends - sends0 <= 6, 'the whole restart took ' .. (W.sends - sends0) .. ' messages, not one per client')
+  for _, cl in ipairs(W.clients) do check(#cl.penalties == 0, 'client ' .. cl.car.sessionID .. ' was not penalised in the whole caution') end
   check(not watch.dirty, 'compliant drivers were never warned during the whole caution' .. (watch.dirty and (': ' .. watch.dirty) or ''))
   local greenAt = W.t
   byId[5].stopped = true -- stops again right after the restart
@@ -531,6 +539,7 @@ local function scenarioRolling(useCountdown)
   local took = W.t - started
   check(g.phase == GREEN and g.reason == 0 and g.seq > st.seq and took > 85 and took < 135, 'one pace lap, then the start: green after ' .. string.format('%.0f', took) .. ' s')
   check(g.seq == st.seq + 2, 'the pace car left on the last part of that lap: exactly two messages (one to go, green), not an extra lap')
+  for _, cl in ipairs(W.clients) do check(#cl.penalties == 0, 'client ' .. cl.car.sessionID .. ' was not penalised at the start') end
   check(not watch.dirty, 'nobody who followed the rules was warned' .. (watch.dirty and (': ' .. watch.dirty) or ''))
   run(40)
   everyone(GREEN, 'the race goes on green, no automatic caution right after the start')
@@ -707,6 +716,102 @@ local function scenarioOldCsp()
   check(warned, 'the player is told that the flag cannot reach him')
 end
 
+local function kinds(cl) local a = {} for _, p in ipairs(cl.penalties) do a[#a + 1] = p.kind end return table.concat(a, ',') end
+local function noteOf(cl) local n = cl.oval.note(); return n and n.title or '' end
+
+local function speeder(cfg, admin)
+  local byId = field(8, 45, 200, cfg, admin or 1)
+  run(10)
+  W.clients[1].chat('!yellow')
+  run(1)
+  byId[5].over = 25 -- 25 km/h above the limit, but keeps the order
+  return byId
+end
+
+local function scenarioPenalties()
+  print('== penalties: warning, gas cut, drive-through after the green flag')
+  local byId = speeder()
+  local y = W.t
+  run(45)
+  local me = W.clients[5]
+  check(kinds(me):sub(1, 8) == 'SlowDown' and me.penalties[1].t - y > 14 and me.penalties[1].param == 5, 'first a warning (no game penalty), then a gas cut of 5 s (' .. kinds(me) .. ')')
+  check(not kinds(me):find('MandatoryPits', 1, true) and me.oval.pen().owed == true, 'the third violation does not hand out a drive-through now (the caution is over before it can be served): it is put on the account')
+  local shown = false
+  for _, tx in ipairs(me.texts) do shown = shown or tx:find('DRIVE-THROUGH DUE AFTER THE GREEN FLAG', 1, true) ~= nil end
+  check(shown, 'and the driver is told about it on the screen')
+  for id, cl in ipairs(W.clients) do if id ~= 5 then check(#cl.penalties == 0, 'client ' .. id .. ' followed the rules and was not punished') end end
+  W.clients[1].chat('!green')
+  run(4)
+  local last = me.penalties[#me.penalties]
+  check(last.kind == 'MandatoryPits' and last.param == 3 and me.oval.pen().driving == true and not me.oval.pen().owed, 'the green flag hands it out: 3 laps to serve')
+  shown = false
+  for _, tx in ipairs(me.texts) do shown = shown or tx:find('DRIVE-THROUGH: ENTER THE PIT LANE', 1, true) ~= nil end
+  check(shown, 'and the screen says what to do')
+  byId[5].isInPitlane = true; run(3); byId[5].isInPitlane = false; run(1)
+  check(me.oval.pen().driving == false, 'a drive-through is served after a run through the pit lane')
+
+  print('== gas cuts do not pile up')
+  speeder({ penalty = 'slow', slowSec = 30 })
+  run(45)
+  local cuts = 0
+  for _, p in ipairs(W.clients[5].penalties) do if p.kind == 'SlowDown' then cuts = cuts + 1 end end
+  check(cuts == 1 and noteOf(W.clients[5]):find('ALREADY ACTIVE', 1, true), 'a gas cut that is still running is not extended by the next violation (' .. cuts .. ' cut, note: ' .. noteOf(W.clients[5]) .. ')')
+
+  print('== penalty = off: warnings only')
+  speeder({ penalty = 'off' })
+  run(45)
+  check(#W.clients[5].penalties == 0 and noteOf(W.clients[5]):find('WARNING', 1, true), 'nothing is applied to the car, the driver is only warned')
+
+  print('== penalty = slow: never more than a gas cut')
+  speeder({ penalty = 'slow' })
+  run(45)
+  check(kinds(W.clients[5]):find('SlowDown', 1, true) and not kinds(W.clients[5]):find('MandatoryPits', 1, true), 'only gas cuts (' .. kinds(W.clients[5]) .. ')')
+
+  print('== passing the pace car counts double')
+  local b2 = field(8, 45, 200, { paceLeadM = 20 }, 1)
+  run(10)
+  W.clients[1].chat('!yellow')
+  b2[1].hold = 106 -- the leader keeps just under the limit and creeps past the pace car
+  run(30)
+  check(kinds(W.clients[1]):sub(1, 8) == 'SlowDown' and W.clients[1].messages[1]:find('Passed the pace car', 1, true), 'a gas cut at the very first violation: ' .. (W.clients[1].messages[1] or '-'))
+
+  print('== being pushed is no fault')
+  speeder()
+  local mine = W.clients[5]
+  for _ = 1, 25 do W.clients[5].hitcb(0); run(1) end
+  check(#mine.penalties == 0 and mine.oval.note() == nil, 'nobody is punished for what happens within three seconds of a contact')
+  run(20)
+  check(mine.oval.note() ~= nil, 'but the rules apply again when the contacts stop')
+
+  print('== the pit lane is exempt')
+  local b3 = speeder()
+  b3[5].isInPitlane = true
+  run(40)
+  check(#W.clients[5].penalties == 0 and W.clients[5].oval.note() == nil, 'nothing happens to a car in the pit lane')
+
+  print('== the game refuses the penalty')
+  W.penaltyFails = true
+  speeder()
+  W.penaltyFails = true
+  run(45)
+  check(#W.errors == 0 and noteOf(W.clients[5]):find('NOT ENFORCED', 1, true), 'no script error, and the driver is told that it is not enforced')
+  W.penaltyFails = false
+
+  print('== jumping the restart')
+  local b4 = field(8, 45, 200, nil, 1)
+  run(10)
+  W.clients[1].chat('!yellow')
+  untilTrue(function() return W.clients[2].oval.state().phase == ONE_TO_GO end, 400, 'one to go')
+  b4[4].ignore = true
+  run(20)
+  local jumped = false
+  for _, m in ipairs(W.clients[4].messages) do jumped = jumped or m:find('Jumped the restart', 1, true) ~= nil end
+  check(jumped and not kinds(W.clients[4]):find('MandatoryPits', 1, true) and W.clients[4].oval.pen().owed == true, 'a warning for the speed, then a drive-through on the account for jumping the restart: ' .. table.concat(W.clients[4].messages, ' | '))
+  W.clients[1].chat('!green')
+  run(4)
+  check(kinds(W.clients[4]):find('MandatoryPits', 1, true) ~= nil, 'and it is handed out as soon as the flag is green')
+end
+
 local function scenarioNoScript()
   print('== the lowest session id has no script')
   local byId = field(8, 45, 200, nil, nil, { [1] = true })
@@ -730,6 +835,7 @@ end
 scenarioManual()
 scenarioWreck()
 scenarioModel()
+scenarioPenalties()
 scenarioGrid()
 scenarioRolling(true)
 scenarioRolling(false)
