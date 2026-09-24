@@ -10,7 +10,7 @@ local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
 local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {} } -- t in seconds
-local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults = 0, {}, {}, {}, 60, false, { rolling = 0 } end
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0 end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
 local dummy
@@ -19,7 +19,7 @@ local function noop() end
 
 local function newEnv(client, cfgOverride)
   local car = client.car
-  local sim = { carsCount = #W.cars, trackLengthM = TRACK, currentSessionTime = 0, raceSessionType = 3, isSessionStarted = true, isOnlineRace = true, isAdmin = client.admin }
+  local sim = { carsCount = #W.cars, trackLengthM = TRACK, currentSessionTime = 0, raceSessionType = 3, isSessionStarted = true, timeToSessionStart = -1, isOnlineRace = true, isAdmin = client.admin }
   client.sim = sim
   local env = setmetatable({ OVAL_TEST = true, script = {}, math = math, string = string, table = table, pairs = pairs, ipairs = ipairs,
     pcall = pcall, tostring = tostring, type = type, next = next, setmetatable = setmetatable }, { __index = function(_, k) return rawget(_G, k) end })
@@ -130,7 +130,10 @@ end
 local function step()
   W.t = W.t + DT
   local ms = W.t * 1000
-  for _, cl in ipairs(W.clients) do cl.sim.currentSessionTime, cl.sim.carsCount = ms, #W.cars end
+  for _, cl in ipairs(W.clients) do
+    cl.sim.currentSessionTime, cl.sim.carsCount = ms + W.clockOffset * 1000, #W.cars
+    cl.sim.timeToSessionStart = W.tts and math.max(-1, -ms) or -1 -- the game's countdown, -1 when it is not available
+  end
   -- deliver messages
   local rest = {}
   for _, m in ipairs(W.queue) do
@@ -305,7 +308,7 @@ local function scenarioAuto()
     prev = byId[id]
   end
   print(string.format('     one to go after %.0f s of caution, widest gap in the pack %.0f m', W.t - cautionAt, worst))
-  check(W.t - cautionAt > 100, 'at least cautionLaps pace laps first')
+  check(W.t - cautionAt > 85 and W.t - cautionAt < 160, 'one pace lap, not three: one to go after ' .. string.format('%.0f', W.t - cautionAt) .. ' s')
   check(worst < 60, 'the field is bunched when one to go is shown')
   runClean(1)
   everyone(ONE_TO_GO, 'shows one to go')
@@ -388,23 +391,30 @@ local function scenarioGrid()
   check(W.clients[1].oval.state().cause == 3, 'but a car that stops after racing does')
 end
 
-local function scenarioRolling()
-  print('== rolling start')
-  resetWorld()
-  W.defaults.rolling, W.hold = 1, true
+local function grid(n)
   local byId, initial = {}, {}
-  for i = 1, 10 do -- two abreast, rows 20 m apart, the outside car 8 m behind its row mate
+  for i = 1, n do -- two abreast, rows 20 m apart, the outside car 8 m behind its row mate
     byId[i] = addCar(i, 0.999 - (math.ceil(i / 2) - 1) * 20 / TRACK - (i % 2 == 0 and 8 or 0) / TRACK, 0, { cruise = 200 })
     initial[i] = byId[i]
   end
-  for _, c in ipairs(initial) do addClient(c, false, { formationLaps = 2 }) end
+  for _, c in ipairs(initial) do addClient(c, false) end
+  return byId
+end
+
+local function scenarioRolling(useCountdown)
+  print(useCountdown and '== rolling start on the countdown signal' or '== rolling start when the countdown is not available')
+  resetWorld()
+  W.defaults.rolling, W.hold, W.tts, W.clockOffset = 1, true, useCountdown, 6 -- the session clock is already running during the lights
+  local byId = grid(10)
   W.t = -6
-  run(5)
-  everyone(GREEN, 'the field waits on the grid while the lights count down')
+  run(5.5)
+  everyone(GREEN, 'the field waits while the lights count down, the pace car does not leave early')
+  check(W.clients[1].oval.state().seq == 0, 'nothing was sent during the countdown')
   local watch = {}
-  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 5, 'the rolling start')
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 6, 'the rolling start')
   local st = W.clients[1].oval.state()
-  check(st.reason == 2 and st.from == 1 and W.t < 1.5, 'the pace car is released with the lights (t=' .. string.format('%.1f', W.t) .. ')')
+  local delay = W.t
+  check(st.reason == 2 and st.from == 1 and delay >= 0 and delay < (useCountdown and 0.6 or 3), 'the pace car is released when the lights go out (' .. string.format('%.1f', delay) .. ' s after)')
   check(table.concat(st.order, ',') == '1,2,3,4,5,6,7,8,9,10', 'the order is the grid order (' .. table.concat(st.order, ',') .. ')')
   local started = W.t
   run(3)
@@ -413,15 +423,46 @@ local function scenarioRolling()
   run(0.5)
   check(not W.clients[2].oval.local1().passing, 'a row mate 8 m ahead on the launch is not yet a pass')
   two.splinePosition = one.splinePosition - 8 / TRACK
-  for _ = 1, math.floor(400 / DT) do
+  for _ = 1, math.floor(300 / DT) do
     step(); watchClean(watch, started + 25)
     if W.clients[1].oval.state().phase == GREEN and W.t > started + 20 then break end
   end
   local g = W.clients[1].oval.state()
-  check(g.phase == GREEN and g.reason == 0 and g.seq > st.seq and W.t - started > 250, 'the flag turns green only after formationLaps pace laps (' .. string.format('%.0f', W.t - started) .. ' s after the start)')
+  local took = W.t - started
+  check(g.phase == GREEN and g.reason == 0 and g.seq > st.seq and took > 85 and took < 135, 'one pace lap, then the start: green after ' .. string.format('%.0f', took) .. ' s')
+  check(g.seq == st.seq + 2, 'the pace car left on the last part of that lap: exactly two messages (one to go, green), not an extra lap')
   check(not watch.dirty, 'nobody who followed the rules was warned' .. (watch.dirty and (': ' .. watch.dirty) or ''))
   run(40)
   everyone(GREEN, 'the race goes on green, no automatic caution right after the start')
+end
+
+local function scenarioNotARace()
+  print('== practice and qualifying: nothing happens')
+  resetWorld()
+  W.defaults.rolling, W.hold, W.clockOffset = 1, true, 6
+  local byId = grid(6)
+  for _, cl in ipairs(W.clients) do cl.sim.raceSessionType = 2 end
+  W.t = -6
+  run(10)
+  W.clients[3].hitcb(0); byId[3].speedKmh = 20 -- a wreck
+  byId[4].stopped = true -- and a car that stops
+  run(30)
+  for _, cl in ipairs(W.clients) do check(cl.oval.state().seq == 0, 'client ' .. cl.car.sessionID .. ' saw no pace car in qualifying') end
+  check(W.clients[1].chat('!yellow') == false, 'even !yellow is not handled outside a race')
+end
+
+local function scenarioLeaderless()
+  print('== nobody is left to cross the line')
+  local byId = field(6, 45, 200, { cautionLaps = 1 })
+  run(30)
+  byId[3].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  byId[3].isInPitlane = true
+  untilTrue(function() return W.clients[1].oval.state().phase == ONE_TO_GO end, 400, 'one to go')
+  for _, c in pairs(byId) do c.isInPitlane = true end -- everybody dives into the pits
+  local at = W.t
+  untilTrue(function() return W.clients[1].oval.state().phase == GREEN end, 200, 'the green flag')
+  check(W.t - at < 150, 'the flag turns green by itself after 1.5 laps (' .. string.format('%.0f', W.t - at) .. ' s)')
 end
 
 local function scenarioNoScript()
@@ -445,7 +486,10 @@ end
 scenarioManual()
 scenarioWreck()
 scenarioGrid()
-scenarioRolling()
+scenarioRolling(true)
+scenarioRolling(false)
+scenarioNotARace()
+scenarioLeaderless()
 scenarioNoScript()
 scenarioAuto()
 scenarioGiveUp()

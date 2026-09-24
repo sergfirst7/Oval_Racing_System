@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 8.2'
+local VERSION = 'Oval 8.3'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -21,8 +21,9 @@ local cfg = ac.configValues({
   rolling = 1,         -- 1: the race starts behind the pace car (rolling start); 0: standing start
   formationLaps = 1,   -- pace laps of the rolling start before the field may go green
   startLeadM = 40,     -- how far ahead of pole position the pace car starts
-  cautionLaps = 2,     -- pace laps before the field may be sent back to green
-  maxCautionLaps = 6,  -- restart anyway after this many pace laps
+  cautionLaps = 1,     -- pace laps before the field may be sent back to green
+  maxCautionLaps = 4,  -- restart anyway after this many pace laps
+  oneToGoAt = 0.75,    -- the pace car leaves in the last quarter of a lap (track position 0..1), green at the line
   everySession = 0,    -- 1: run in every session, not only in races (testing)
   debug = 0,           -- 1: show the debug panel (chat command !ovaldebug toggles it for you)
 })
@@ -190,6 +191,7 @@ end
 -- A client only acts after `rank * RANK_DELAY` seconds without a newer state, so a car whose
 -- driver has no script cannot stall the flow: the next one takes over.
 local pend, lastLeader, bunchT = { key = nil }, nil, 0
+local start = {}
 local function due(key, rank)
   if pend.key ~= key or pend.seq ~= S.seq or uiTime - pend.last > 0.5 then pend = { key = key, seq = S.seq, at = uiTime } end
   pend.last = uiTime
@@ -259,17 +261,23 @@ local function control(cars, dt, rank)
   local order = desiredOrder(cars)
   if order and due('order', rank) then return commit(S.phase, S.reason, S.cause, S.tStart, S.s0, order) end
 
-  local laps = S.kmh / 3.6 * (clock() - S.tStart) / 1000 / trackLen()
-  local need = S.reason == 2 and cfg.formationLaps or cfg.cautionLaps
-  if S.phase == CAUTION and bunched(cars) and not hazard(cars) then bunchT = bunchT + dt else bunchT = 0 end
-  if leaderCrossed(cars) then ctl.cross = { at = uiTime, go = S.phase == ONE_TO_GO or (laps >= need and bunchT > 1.5) or laps >= cfg.maxCautionLaps } end
-  local x = ctl.cross
-  if not (x and x.go and uiTime - x.at < 2.5 + rank * RANK_DELAY) then return end
-  if S.phase == ONE_TO_GO then
-    if due('green', rank) then release() end
-  elseif due('one', rank) then
-    commit(ONE_TO_GO, S.reason, S.cause, clock(), pacePos(), S.order)
+  local len = trackLen()
+  if S.phase == CAUTION then
+    local laps = S.kmh / 3.6 * (clock() - S.tStart) / 1000 / len
+    local need = S.reason == 2 and cfg.formationLaps or cfg.cautionLaps
+    if bunched(cars) and not hazard(cars) then bunchT = bunchT + dt else bunchT = 0 end
+    local pos = pacePos()
+    -- laps counted up to the line where the flag will turn green; a tenth of a lap of slack for the head start
+    local ready = laps >= cfg.maxCautionLaps or (laps + 1 - pos >= need - 0.1 and bunchT > 1.5)
+    if ready and pos >= cfg.oneToGoAt and due('one', rank) then -- the pace car pulls off before the last turns
+      commit(ONE_TO_GO, S.reason, S.cause, clock(), pos, S.order)
+    end
+    return
   end
+  -- one to go: green when the leader crosses the line; after 1.5 laps in any case (nobody left to cross it)
+  if leaderCrossed(cars) then ctl.cross = uiTime end
+  local late = clock() - S.tStart > 1500 * len / (S.kmh / 3.6)
+  if (late or (ctl.cross and uiTime - ctl.cross < 2.5 + rank * RANK_DELAY)) and due('green', rank) then release() end
 end
 
 -- ── entry points ─────────────────────────────────────────────────────────────
@@ -281,7 +289,7 @@ local function guard(fn)
 end
 
 local function isActive() return cfg.everySession == 1 or sim.raceSessionType == ac.SessionType.Race end
-local function reset() S, L1, watch, ctl = freshState(), {}, {}, {} end
+local function reset() S, L1, watch, ctl, start = freshState(), {}, {}, {}, {} end
 ac.onSessionStart(reset)
 
 -- Chat commands: !ovaldebug (anyone, only for yourself), !yellow / !green (admin)
@@ -294,12 +302,31 @@ ac.onOutgoingChatMessage(function(msg)
   return true
 end)
 
-local function startRace(rank, now) -- lights out: the field follows the pace car instead of racing away
-  if cfg.rolling ~= 1 or S.seq > 0 or now < 0 or now > 15000 or not due('start', rank) then return end
+-- The session clock starts at 0 when the session is created, 30 s before the lights go out, so it
+-- says nothing about the start. Signals: the countdown of the game (timeToSessionStart) has run
+-- out, or the field that stood on the grid has started to move.
+local function lightsOut(cars, now)
+  local tts, fast = sim.timeToSessionStart, 0
+  for _, c in pairs(cars) do fast = math.max(fast, c.speedKmh) end
+  if tts and tts > 1000 then start.armed = true end
+  if fast < 15 and now < 120000 then start.grid = true end -- has seen the whole field standing
+  if start.grid and not start.done and uiTime - (start.logAt or -10) > 5 then
+    start.logAt = uiTime
+    ac.log(string.format('Oval: waiting for the lights, tts=%s started=%s clock=%d fast=%d', tostring(tts), tostring(sim.isSessionStarted), math.floor(now), math.floor(fast)))
+  end
+  return start.grid and ((start.armed and tts <= 0) or fast > 15)
+end
+
+local function startRace(cars, rank, now) -- lights out: the field follows the pace car instead of racing away
+  if S.seq > 0 then start.done = true end
+  if cfg.rolling ~= 1 or start.done or not lightsOut(cars, now) or not due('start', rank) then return end
   local list = {}
-  for id, c in pairs(activeCars()) do list[#list + 1] = string.format('%d:p%d:%.4f', id, c.racePosition, c.splinePosition) end
-  ac.log('Oval: rolling start, grid ' .. table.concat(list, ' '))
+  for id, c in pairs(cars) do list[#list + 1] = string.format('%d:p%d:%.4f', id, c.racePosition, c.splinePosition) end
   deploy(2, NONE)
+  if S.seq > 0 then
+    start.done = true
+    ac.log(string.format('Oval: lights out (tts=%s clock=%d), rolling start, grid %s', tostring(sim.timeToSessionStart), math.floor(now), table.concat(list, ' ')))
+  end
 end
 
 function script.update(dt)
@@ -315,7 +342,7 @@ function script.update(dt)
     local rank = 0
     for id in pairs(cars) do if id < me.sessionID then rank = rank + 1 end end
     hudCars, hudRank = cars, rank
-    if S.phase == GREEN then startRace(rank, now); watchSelf(dt, now) end
+    if S.phase == GREEN then startRace(cars, rank, now); watchSelf(dt, now) end
     control(cars, dt, rank)
     localCheck(cars)
   end)()
