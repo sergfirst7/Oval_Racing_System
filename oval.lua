@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 9.0'
+local VERSION = 'Oval 9.1'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -25,7 +25,7 @@ local cfgDefaults = {
   passSec = 1.2,       -- being ahead of the car in front for this long is a violation
   strikeGapSec = 8,    -- the same violation is counted at most once per this many seconds
   slowSec = 5,         -- length of the gas cut penalty
-  driveLaps = 2,       -- laps to serve a drive-through
+  driveLaps = 3,       -- laps the game gives to serve a drive-through (it counts them from the green flag, when it is handed out)
   rolling = 1,         -- 1: the race starts behind the pace car (rolling start); 0: standing start
   formationLaps = 1,   -- pace laps of the rolling start before the field may go green
   startLeadM = 40,     -- how far ahead of pole position the pace car starts
@@ -184,13 +184,17 @@ local function penalize(why, weight)
   pen.last[why], pen.strikes = uiTime, pen.strikes + weight
   local level, title, applied = pen.strikes, 'WARNING', true
   if cfg.penalty ~= 'off' and level >= 2 then
-    if cfg.penalty == 'drive' and level >= 3 and not pen.driving then
-      title = 'DRIVE-THROUGH PENALTY'
-      applied = setPenalty('MandatoryPits', cfg.driveLaps)
-      if applied then pen.driving, pen.pitSeen = true, false end
+    if cfg.penalty == 'drive' and level >= 3 and not pen.owed and not pen.driving then
+      -- The game counts the laps to serve it from the moment it is handed out, and a caution is over
+      -- in about a lap: handed out then, it would run out before the field can serve it (black flag,
+      -- teleport to the pits). So it is handed out when the race is green again.
+      title, pen.owed = 'DRIVE-THROUGH AFTER THE GREEN', true
+    elseif uiTime - (pen.slowAt or -100) < cfg.slowSec + 3 then
+      title = 'GAS CUT (ALREADY ACTIVE)' -- a running gas cut is not extended
     else
       title = 'GAS CUT ' .. cfg.slowSec .. ' S'
       applied = setPenalty('SlowDown', cfg.slowSec)
+      if applied then pen.slowAt = uiTime end
     end
   end
   if not applied then title = title .. ' (NOT ENFORCED)' end
@@ -215,6 +219,18 @@ local function judge(dt)
     local pace, restart = L1.key == 'pace', S.phase == ONE_TO_GO
     penalize(pace and 'Passed the pace car' or restart and 'Jumped the restart' or 'Passed under caution', (pace or restart) and 2 or 1)
   end
+end
+
+-- a drive-through that is due is handed out once the race is green again
+local function handOutOwed()
+  if not pen.owed or pen.driving or S.phase ~= GREEN or clock() - S.tStart < 2000 then return end
+  pen.owed = false
+  local applied = setPenalty('MandatoryPits', cfg.driveLaps)
+  if applied then pen.driving, pen.pitSeen = true, false end
+  local title = 'DRIVE-THROUGH PENALTY' .. (applied and '' or ' (NOT ENFORCED)')
+  penNote = { title = title, why = 'Enter the pit lane now', untilT = uiTime + 7 }
+  pcall(ac.setMessage, title, 'Enter the pit lane now', 'illegal', 7)
+  ac.log('Oval: ' .. title .. ' handed out after the green flag')
 end
 
 -- a drive-through is served once the car has been through the pit lane
@@ -601,6 +617,7 @@ function script.update(dt)
     control(cars, dt, rank)
     localCheck(cars, dt)
     servePenalty(me)
+    handOutOwed()
     updatePaceCar()
   end)()
 end
@@ -621,7 +638,7 @@ local function drawDebug()
   local ids = {}
   for id in pairs(presence) do ids[#ids + 1] = id end
   table.sort(ids)
-  ui.dwriteDrawText(string.format('penalty %s  strikes %d  drive-through pending %s  server penalties %s', cfg.penalty, pen.strikes, tostring(pen.driving == true), tostring(sim.penaltiesEnabled)), 13, vec2(12, 90), yel)
+  ui.dwriteDrawText(string.format('penalty %s  strikes %d  drive-through due %s pending %s  server penalties %s', cfg.penalty, pen.strikes, tostring(pen.owed == true), tostring(pen.driving == true), tostring(sim.penaltiesEnabled)), 13, vec2(12, 90), yel)
   ui.dwriteDrawText(string.format('CSP %s  race %s  direct %s  sent %d got %d stale %d  script on: %s', tostring(build), tostring(sessionType()), tostring(sim.directMessagingAvailable),
     stats.sent, stats.got, stats.stale, table.concat(ids, ',')), 13, vec2(12, 74), yel)
 end
@@ -644,6 +661,12 @@ function script.drawUI()
       ui.drawRectFilled(vec2(x0, y0), vec2(x0 + w * k0, y0 + h * k0), RED, 12 * k0)
       centered(penNote.title, 40 * k0, win.x / 2, y0 + 12 * k0, rgbm(1, 1, 1, 1))
       centered(penNote.why, 22 * k0, win.x / 2, y0 + 78 * k0, rgbm(1, 1, 0.7, 1))
+    end
+    local debt = pen.driving and 'DRIVE-THROUGH: ENTER THE PIT LANE' or pen.owed and 'DRIVE-THROUGH DUE AFTER THE GREEN FLAG'
+    if debt then
+      local k1 = win.y / 1080
+      ui.drawRectFilled(vec2(win.x / 2 - 300 * k1, win.y * 0.8), vec2(win.x / 2 + 300 * k1, win.y * 0.8 + 44 * k1), RED, 10 * k1)
+      centered(debt, 22 * k1, win.x / 2, win.y * 0.8 + 8 * k1, rgbm(1, 1, 1, 1))
     end
     local showGreen = S.phase == GREEN and S.seq > 0 and clock() - S.tStart < 5000
     if S.phase == GREEN and not showGreen then return end

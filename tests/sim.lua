@@ -729,20 +729,33 @@ local function speeder(cfg, admin)
 end
 
 local function scenarioPenalties()
-  print('== penalties: warning, gas cut, drive-through, repeat')
+  print('== penalties: warning, gas cut, drive-through after the green flag')
   local byId = speeder()
   local y = W.t
   run(45)
   local me = W.clients[5]
-  check(kinds(me):sub(1, 31) == 'SlowDown,MandatoryPits,SlowDown', 'first a warning (no game penalty), then a gas cut, then a drive-through, then a gas cut while it is pending: ' .. kinds(me))
-  check(me.penalties[1].t - y > 14 and me.penalties[1].param == 5 and me.penalties[2].param == 2, 'the first game penalty comes only after the warning (' .. string.format('%.0f', me.penalties[1].t - y) .. ' s), gas cut 5 s, drive-through 2 laps')
+  check(kinds(me):sub(1, 8) == 'SlowDown' and me.penalties[1].t - y > 14 and me.penalties[1].param == 5, 'first a warning (no game penalty), then a gas cut of 5 s (' .. kinds(me) .. ')')
+  check(not kinds(me):find('MandatoryPits', 1, true) and me.oval.pen().owed == true, 'the third violation does not hand out a drive-through now (the caution is over before it can be served): it is put on the account')
+  local shown = false
+  for _, tx in ipairs(me.texts) do shown = shown or tx:find('DRIVE-THROUGH DUE AFTER THE GREEN FLAG', 1, true) ~= nil end
+  check(shown, 'and the driver is told about it on the screen')
   for id, cl in ipairs(W.clients) do if id ~= 5 then check(#cl.penalties == 0, 'client ' .. id .. ' followed the rules and was not punished') end end
+  W.clients[1].chat('!green')
+  run(4)
+  local last = me.penalties[#me.penalties]
+  check(last.kind == 'MandatoryPits' and last.param == 3 and me.oval.pen().driving == true and not me.oval.pen().owed, 'the green flag hands it out: 3 laps to serve')
+  shown = false
+  for _, tx in ipairs(me.texts) do shown = shown or tx:find('DRIVE-THROUGH: ENTER THE PIT LANE', 1, true) ~= nil end
+  check(shown, 'and the screen says what to do')
   byId[5].isInPitlane = true; run(3); byId[5].isInPitlane = false; run(1)
   check(me.oval.pen().driving == false, 'a drive-through is served after a run through the pit lane')
-  run(20)
-  local n = 0
-  for _, p in ipairs(me.penalties) do if p.kind == 'MandatoryPits' then n = n + 1 end end
-  check(n == 2, 'and the next violation earns a new one')
+
+  print('== gas cuts do not pile up')
+  speeder({ penalty = 'slow', slowSec = 30 })
+  run(45)
+  local cuts = 0
+  for _, p in ipairs(W.clients[5].penalties) do if p.kind == 'SlowDown' then cuts = cuts + 1 end end
+  check(cuts == 1 and noteOf(W.clients[5]):find('ALREADY ACTIVE', 1, true), 'a gas cut that is still running is not extended by the next violation (' .. cuts .. ' cut, note: ' .. noteOf(W.clients[5]) .. ')')
 
   print('== penalty = off: warnings only')
   speeder({ penalty = 'off' })
@@ -793,7 +806,10 @@ local function scenarioPenalties()
   run(20)
   local jumped = false
   for _, m in ipairs(W.clients[4].messages) do jumped = jumped or m:find('Jumped the restart', 1, true) ~= nil end
-  check(jumped and kinds(W.clients[4]):sub(1, 13) == 'MandatoryPits', 'a warning for the speed, then a drive-through for jumping the restart: ' .. table.concat(W.clients[4].messages, ' | '))
+  check(jumped and not kinds(W.clients[4]):find('MandatoryPits', 1, true) and W.clients[4].oval.pen().owed == true, 'a warning for the speed, then a drive-through on the account for jumping the restart: ' .. table.concat(W.clients[4].messages, ' | '))
+  W.clients[1].chat('!green')
+  run(4)
+  check(kinds(W.clients[4]):find('MandatoryPits', 1, true) ~= nil, 'and it is handed out as soon as the flag is green')
 end
 
 local function scenarioNoScript()
