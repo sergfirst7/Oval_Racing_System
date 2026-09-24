@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 8.3'
+local VERSION = 'Oval 8.5'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -14,10 +14,11 @@ local cfg = ac.configValues({
   paceLeadM = 300,     -- how far ahead of the race leader the pace car appears
   autoCaution = 1,     -- 1: a wreck or a car stopped on track calls the caution automatically
   slowKmh = 40,        -- below this speed a car counts as stopped
+  limpRatio = 0.5,     -- a car that stays below this share of its own top speed (and under 110 km/h) counts as stopped, 0 = off
+  wreckDropKmh = 60,   -- losing this much speed within 0.4 s (35 within a second of a contact) is a wreck
   stopSec = 3,         -- how long a car must stay that slow to count as an incident
   raceKmh = 80,        -- a car only counts after it has been this fast since the last green
-  startGraceSec = 20,  -- no automatic caution during the first seconds of the race
-  cooldownSec = 20,    -- no automatic caution right after a green flag
+  cooldownSec = 4,     -- no automatic caution in the first seconds after a green flag
   rolling = 1,         -- 1: the race starts behind the pace car (rolling start); 0: standing start
   formationLaps = 1,   -- pace laps of the rolling start before the field may go green
   startLeadM = 40,     -- how far ahead of pole position the pace car starts
@@ -164,27 +165,52 @@ local function localCheck(cars)
 end
 
 -- ── incidents: every client watches its own car ──────────────────────────────
--- A wreck (hit + speed collapse) calls the caution at once, a car that stays slow for stopSec
--- calls it too. Remote cars are not watched: their data is late, and the owner knows best.
-pcall(ac.onCarCollision, 0, function()
-  if (watch.peak or 0) > 100 then watch.hit = { t = uiTime, peak = watch.peak } end
+-- Own data is the only reliable data. A wreck is a sudden loss of speed (with or without a contact
+-- event), a car that stays slow for stopSec is stopped: standing, or limping below limpRatio of the
+-- speed it was doing. Remote cars are not watched: their data is late and the owner knows best.
+local okHit, errHit = pcall(ac.onCarCollision, 0, function()
+  local peak = watch.peak or 0
+  if uiTime - (watch.hitLog or -5) > 2 then
+    watch.hitLog = uiTime
+    ac.log(string.format('Oval: contact, speed=%d peak=%d', math.floor(ac.getCar(0).speedKmh), math.floor(peak)))
+  end
+  if peak > 100 then watch.hit = { t = uiTime, peak = peak } end
 end)
+if not okHit then ac.log('Oval: contact events unavailable: ' .. tostring(errHit)) end
 
 local function watchSelf(dt, now)
   local me = ac.getCar(0)
   local speed = me.speedKmh
   watch.peak = math.max(speed, (watch.peak or 0) - 150 * dt) -- speed of the last second or so
+  watch.top = math.max(speed, (watch.top or 0) - 3 * dt) -- the speed we were doing, forgotten slowly
+  local h = watch.hist or {}
+  watch.hist = h
+  h[#h + 1] = { t = uiTime, v = speed }
+  while uiTime - h[1].t > 1 do table.remove(h, 1) end
+  local function lost(window) -- speed lost within the last `window` seconds
+    local top = speed
+    for _, x in ipairs(h) do if uiTime - x.t <= window and x.v > top then top = x.v end end
+    return top - speed
+  end
+
   if speed > cfg.raceKmh then watch.fast = true end
-  if cfg.autoCaution ~= 1 or not watch.fast or me.isInPitlane or me.isRetired or now < cfg.startGraceSec * 1000
-    or (S.seq > 0 and now - S.tStart < cfg.cooldownSec * 1000) then
+  if cfg.autoCaution ~= 1 or not watch.fast or me.isInPitlane or me.isRetired or (S.seq > 0 and now - S.tStart < cfg.cooldownSec * 1000) then
     watch.slow, watch.hit = 0, nil
     return
   end
-  local h = watch.hit
-  if h and uiTime - h.t > 2.5 then watch.hit = nil
-  elseif h and speed < h.peak * 0.35 then return deploy(3, me.sessionID) end
-  watch.slow = speed < cfg.slowKmh and (watch.slow or 0) + dt or 0
-  if watch.slow >= cfg.stopSec then deploy(1, me.sessionID) end
+  local hit = watch.hit
+  if hit and uiTime - hit.t > 2.5 then hit = nil; watch.hit = nil end
+  local recent = hit and uiTime - hit.t < 1
+  if lost(0.4) >= cfg.wreckDropKmh or (recent and lost(1) >= 35) or (hit and speed < hit.peak * 0.35) then
+    ac.log(string.format('Oval: wreck, speed=%d lost=%d contact=%s', math.floor(speed), math.floor(lost(1)), tostring(hit ~= nil)))
+    return deploy(3, me.sessionID)
+  end
+  local slow = speed < cfg.slowKmh or (cfg.limpRatio > 0 and speed < cfg.limpRatio * watch.top and speed < 110)
+  watch.slow = slow and (watch.slow or 0) + dt or 0
+  if watch.slow >= cfg.stopSec then
+    ac.log(string.format('Oval: stopped car, speed=%d top=%d', math.floor(speed), math.floor(watch.top)))
+    deploy(1, me.sessionID)
+  end
 end
 
 -- ── restart handling: every client computes it, the lowest session ID acts first ─────────
@@ -314,7 +340,10 @@ local function lightsOut(cars, now)
     start.logAt = uiTime
     ac.log(string.format('Oval: waiting for the lights, tts=%s started=%s clock=%d fast=%d', tostring(tts), tostring(sim.isSessionStarted), math.floor(now), math.floor(fast)))
   end
-  return start.grid and ((start.armed and tts <= 0) or fast > 15)
+  -- the countdown decides; movement counts only when the game gives no countdown (cars jump to the grid at the start of a session)
+  local ended = start.armed and (tts or -1) <= 0
+  local moved = not start.armed and now > 3000 and fast > 15
+  return start.grid and (ended or moved)
 end
 
 local function startRace(cars, rank, now) -- lights out: the field follows the pace car instead of racing away
