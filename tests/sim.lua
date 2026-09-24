@@ -9,7 +9,7 @@ local GREEN, CAUTION, ONE_TO_GO = 0, 1, 2
 local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
-local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {} } -- t in seconds
+local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {}, logs = {}, oldApi = {} } -- t in seconds
 local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0, false, 'ok' end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
@@ -64,7 +64,7 @@ local function newEnv(client, cfgOverride)
     onSessionStart = noop,
     onOutgoingChatMessage = function(cb) client.chat = cb end,
     getDriverName = function(i) return 'car' .. i end,
-    log = function(m) if tostring(m):find('rror') or tostring(m):find('unavailable') then W.errors[#W.errors + 1] = tostring(m) end end,
+    log = function(m) m = tostring(m); W.logs[#W.logs + 1] = m; if m:find('rror') then W.errors[#W.errors + 1] = m end end,
     onCarCollision = function(_, cb) client.hitcb = cb end,
     OnlineEvent = function(_, cb)
       local buf = { order = {} }
@@ -85,6 +85,8 @@ local function newEnv(client, cfgOverride)
       return send, function() return buf end
     end,
   }
+  for k in pairs(W.oldApi) do env.ac[k] = nil end -- pretend to be a CSP that lacks these functions
+  client.texts = {}
   local gfx = { loads = {}, lights = {}, meshes = {} }
   client.gfx = gfx
   local function node()
@@ -118,7 +120,7 @@ local function newEnv(client, cfgOverride)
     return pos.y + 1
   end }
   env.render = setmetatable({ calls = {}, BlendMode = { BlendAdd = 4, AlphaBlend = 1 } }, { __index = function(tt, k) return function() tt.calls[k] = (tt.calls[k] or 0) + 1 end end })
-  local uiStub = setmetatable({ windowSize = function() return { x = 1920, y = 1080 } end, measureDWriteText = function() return { x = 100, y = 20 } end },
+  local uiStub = setmetatable({ dwriteDrawText = function(text) client.texts[#client.texts + 1] = tostring(text) end, windowSize = function() return { x = 1920, y = 1080 } end, measureDWriteText = function() return { x = 100, y = 20 } end },
     { __index = function() return noop end })
   env.ui, env.vec2, env.vec3, env.rgbm = uiStub, dummy, vec3, dummy
   env.rgb = function(r, g, b) return { r = r, g = g, b = b } end
@@ -207,7 +209,7 @@ local function step()
   end
   table.sort(W.cars, function(a, b) return a.lapCount + a.splinePosition > b.lapCount + b.splinePosition end)
   for i, c in ipairs(W.cars) do c.racePosition = i end
-  for _, cl in ipairs(W.clients) do if cl.connected then cl.env.script.update(DT); cl.env.script.drawUI(); cl.env.script.draw3D() end end
+  for _, cl in ipairs(W.clients) do if cl.connected then cl.texts = {}; cl.env.script.update(DT); cl.env.script.drawUI(); cl.env.script.draw3D() end end
 end
 
 local function run(sec) for _ = 1, math.floor(sec / DT) do step() end end
@@ -265,6 +267,14 @@ local function scenarioManual()
   local admin = 5
   run(10)
   check(W.clients[1].oval.state().phase == GREEN, 'starts green')
+  local known = true
+  for _, cl in ipairs(W.clients) do
+    local n = 0
+    for _ in pairs(cl.oval.presence()) do n = n + 1 end
+    known = known and n == 9
+  end
+  check(known, 'every client has heard from all nine script users (the greetings)')
+  check(W.clients[2].oval.stats().sent >= 1 and W.clients[2].oval.stats().got >= 9, 'and counts what it sent and received')
   check(W.clients[admin].chat('!yellow') == true, 'admin !yellow is handled (kept out of chat)')
   check(W.clients[1].chat('!yellow') == false, 'non-admin !yellow is left alone')
   run(1)
@@ -620,6 +630,31 @@ local function scenarioModel()
   check(#W.clients[2].gfx.loads == 0 and (W.clients[2].env.render.calls.debugArrow or 0) > 10, 'paceModel = empty: no model, arrow only')
 end
 
+local function scenarioOldCsp()
+  print('== an old CSP that lacks some functions')
+  W.oldApi = { onOutgoingChatMessage = true, onSessionStart = true, configValues = true, getPatchVersionCode = true, onCarCollision = true }
+  local byId = field(6, 45, 200)
+  W.oldApi = {}
+  local before = #W.logs
+  run(30)
+  byId[3].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  check(W.clients[1].oval.state().cause == 3 and #W.errors == 0, 'the script loads and works, only the missing features are gone')
+  local said = table.concat(W.logs, ' ', 1, #W.logs)
+  check(said:find('chat commands unavailable', 1, true) and said:find('session start events unavailable', 1, true), 'and the log says which ones')
+  check(W.clients[1].chat == nil, 'no chat commands then')
+  check(W.clients[1].oval.local1() ~= nil, 'the rules still run')
+
+  print('== no online events at all')
+  W.oldApi = { OnlineEvent = true }
+  field(4, 45, 200)
+  W.oldApi = {}
+  run(2)
+  local warned = false
+  for _, tx in ipairs(W.clients[1].texts) do warned = warned or tx:find('no online events', 1, true) ~= nil end
+  check(warned, 'the player is told that the flag cannot reach him')
+end
+
 local function scenarioNoScript()
   print('== the lowest session id has no script')
   local byId = field(8, 45, 200, nil, nil, { [1] = true })
@@ -627,6 +662,8 @@ local function scenarioNoScript()
   byId[4].stopped = true
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
   check(W.clients[1].oval.state().from == 4, 'the caution comes although the controller-to-be runs nothing')
+  local pr = W.clients[1].oval.presence()
+  check(pr[1] == nil and pr[2] and pr[8], 'the client without the script is not on the list of script users')
   byId[4].isInPitlane = true
   byId[6].isInPitlane = true
   run(6)
@@ -646,6 +683,7 @@ scenarioRolling(true)
 scenarioRolling(false)
 scenarioNotARace()
 scenarioLeaderless()
+scenarioOldCsp()
 scenarioNoScript()
 scenarioAuto()
 scenarioGiveUp()
