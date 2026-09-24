@@ -62,7 +62,7 @@ local function newEnv(client, cfgOverride)
     SessionType = { Race = 3 },
     StructItem = StructItem,
     onSessionStart = noop,
-    PenaltyType = { None = 0, MandatoryPits = 1, TeleportToPits = 2, SlowDown = 3, BlackFlag = 4 },
+    PenaltyType = { None = 0, MandatoryPits = 1, TeleportToPits = 2, SlowDown = 3, BlackFlag = 4, ReleaseBlackFlag = 5 },
     setMessage = function(title, why) client.messages[#client.messages + 1] = title .. ' / ' .. why end,
     getSession = function() return { type = W.sessionType or 3 } end,
     onChatMessage = function(cb) client.incoming = cb end,
@@ -119,8 +119,9 @@ local function newEnv(client, cfgOverride)
   env.ac.trackCoordinateToWorld = roadPoint
   env.physics = { setCarPenalty = function(kind, param)
     if W.penaltyFails then error('physics not available') end
-    local name = kind == 1 and 'MandatoryPits' or kind == 3 and 'SlowDown' or tostring(kind)
+    local name = kind == 1 and 'MandatoryPits' or kind == 3 and 'SlowDown' or kind == 5 and 'ReleaseBlackFlag' or tostring(kind)
     client.penalties[#client.penalties + 1] = { kind = name, param = param, t = W.t }
+    sim.currentPenaltyType, sim.currentPenaltyParameter = kind, param -- what the game reports back
   end, raycastTrack = function(pos, _, _, hit, normal) -- the asphalt lies 1 m below the height of the spline
     if W.ray == 'error' then error('physics not available') end
     if W.ray == 'miss' then return -1 end
@@ -729,8 +730,8 @@ local function speeder(cfg, admin)
 end
 
 local function scenarioPenalties()
-  print('== penalties: warning, gas cut, drive-through after the green flag')
-  local byId = speeder()
+  print('== penalties: warning, gas cut, drive-through after the green flag (penalty = drive)')
+  local byId = speeder({ penalty = 'drive' })
   local y = W.t
   run(45)
   local me = W.clients[5]
@@ -750,6 +751,23 @@ local function scenarioPenalties()
   byId[5].isInPitlane = true; run(3); byId[5].isInPitlane = false; run(1)
   check(me.oval.pen().driving == false, 'a drive-through is served after a run through the pit lane')
 
+  print('== a black flag for an unserved drive-through is released')
+  speeder({ penalty = 'drive' })
+  run(45)
+  W.clients[1].chat('!green')
+  W.logs = {}
+  run(4)
+  local cl, other = W.clients[5], W.clients[6]
+  local seen = false
+  for _, m in ipairs(W.logs) do seen = seen or m:find('game penalty 1/3 lap', 1, true) ~= nil end
+  check(cl.oval.pen().driving == true and seen, 'what the game says about the drive-through is in the log')
+  cl.sim.currentPenaltyType, other.sim.currentPenaltyType = 4, 4 -- the game loses patience with both
+  run(3)
+  check(kinds(cl):sub(-16) == 'ReleaseBlackFlag' and cl.oval.pen().driving == false and noteOf(cl) == 'BLACK FLAG RELEASED', 'the driver of the drive-through is set free again')
+  local releases = 0
+  for _, p in ipairs(cl.penalties) do if p.kind == 'ReleaseBlackFlag' then releases = releases + 1 end end
+  check(releases == 1 and kinds(other) == '', 'once, and a black flag that is not ours is left alone')
+
   print('== gas cuts do not pile up')
   speeder({ penalty = 'slow', slowSec = 30 })
   run(45)
@@ -762,8 +780,8 @@ local function scenarioPenalties()
   run(45)
   check(#W.clients[5].penalties == 0 and noteOf(W.clients[5]):find('WARNING', 1, true), 'nothing is applied to the car, the driver is only warned')
 
-  print('== penalty = slow: never more than a gas cut')
-  speeder({ penalty = 'slow' })
+  print('== the default: never more than a gas cut')
+  speeder()
   run(45)
   check(kinds(W.clients[5]):find('SlowDown', 1, true) and not kinds(W.clients[5]):find('MandatoryPits', 1, true), 'only gas cuts (' .. kinds(W.clients[5]) .. ')')
 
@@ -798,7 +816,7 @@ local function scenarioPenalties()
   W.penaltyFails = false
 
   print('== jumping the restart')
-  local b4 = field(8, 45, 200, nil, 1)
+  local b4 = field(8, 45, 200, { penalty = 'drive' }, 1)
   run(10)
   W.clients[1].chat('!yellow')
   untilTrue(function() return W.clients[2].oval.state().phase == ONE_TO_GO end, 400, 'one to go')
