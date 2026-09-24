@@ -62,6 +62,8 @@ local function newEnv(client, cfgOverride)
     SessionType = { Race = 3 },
     StructItem = StructItem,
     onSessionStart = noop,
+    getSession = function() return { type = W.sessionType or 3 } end,
+    onChatMessage = function(cb) client.incoming = cb end,
     onOutgoingChatMessage = function(cb) client.chat = cb end,
     getDriverName = function(i) return 'car' .. i end,
     log = function(m) m = tostring(m); W.logs[#W.logs + 1] = m; if m:find('rror') then W.errors[#W.errors + 1] = m end end,
@@ -86,6 +88,7 @@ local function newEnv(client, cfgOverride)
     end,
   }
   for k in pairs(W.oldApi) do env.ac[k] = nil end -- pretend to be a CSP that lacks these functions
+  if W.oldApi.structArray then StructItem.array = nil end
   client.texts = {}
   local gfx = { loads = {}, lights = {}, meshes = {} }
   client.gfx = gfx
@@ -644,6 +647,55 @@ local function scenarioOldCsp()
   check(said:find('chat commands unavailable', 1, true) and said:find('session start events unavailable', 1, true), 'and the log says which ones')
   check(W.clients[1].chat == nil, 'no chat commands then')
   check(W.clients[1].oval.local1() ~= nil, 'the rules still run')
+
+  print('== old CSP: commands come back through the incoming chat')
+  W.oldApi = { onOutgoingChatMessage = true }
+  field(4, 45, 200, nil, 2)
+  W.oldApi = {}
+  run(5)
+  W.clients[2].incoming('!yellow', 3)
+  W.clients[1].incoming('!yellow', 0)
+  run(1)
+  everyone(GREEN, 'a message of another player, or of a player who is no admin, is no command')
+  W.clients[2].incoming('!yellow', 0)
+  run(1)
+  check(W.clients[1].oval.state().phase == CAUTION, 'the admin\'s own message coming back calls the caution')
+
+  print('== old CSP: no arrays in the event layout')
+  W.oldApi = { structArray = true }
+  field(4, 45, 200)
+  W.oldApi = {}
+  run(2)
+  local warned2 = false
+  for _, tx in ipairs(W.clients[1].texts) do warned2 = warned2 or tx:find('no online events', 1, true) ~= nil end
+  check(warned2 and #W.errors == 0, 'the script loads, tells the player, and does not fail')
+
+  print('== old CSP: the session type comes from the session')
+  local old = field(4, 45, 200)
+  for _, cl in ipairs(W.clients) do cl.sim.raceSessionType = nil end
+  run(30)
+  old[2].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  check(true, 'a race is recognised without sim.raceSessionType')
+  W.sessionType = 2
+  old = field(4, 45, 200)
+  for _, cl in ipairs(W.clients) do cl.sim.raceSessionType = nil end
+  run(30)
+  old[2].stopped = true
+  run(20)
+  everyone(GREEN, 'and qualifying is recognised as well')
+  W.sessionType = nil
+
+  print('== an error is shown on the screen')
+  local cl = W.clients[1]
+  cl.sim.carsCount = 'boom'
+  cl.env.script.update(DT)
+  cl.texts = {}
+  cl.env.script.drawUI()
+  local shown = false
+  for _, tx in ipairs(cl.texts) do shown = shown or tx:find('OVAL error', 1, true) ~= nil end
+  check(shown, 'the player and whoever looks at his screen can read what failed')
+  W.errors = {} -- that error was on purpose
 
   print('== no online events at all')
   W.oldApi = { OnlineEvent = true }

@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 8.7'
+local VERSION = 'Oval 8.8'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -44,6 +44,7 @@ local function try(what, fn, ...) -- a missing feature costs that feature, not t
   if not good then ac.log('Oval: ' .. what .. ' unavailable: ' .. tostring(err)) end
   return good
 end
+local RACE = ac.SessionType and ac.SessionType.Race or 3
 local okBuild, build = pcall(ac.getPatchVersionCode)
 build = okBuild and build or '?'
 
@@ -56,7 +57,7 @@ local function activeCars() -- sessionID -> car
   local m = {}
   for i = 0, sim.carsCount - 1 do
     local c = ac.getCar(i)
-    if c and c.isConnected and c.isActive then m[c.sessionID] = c end
+    if c and c.isConnected and c.isActive ~= false then m[c.sessionID] = c end
   end
   return m
 end
@@ -98,18 +99,20 @@ local function onState(sender, d)
   adopt({ seq = d.seq, from = from, phase = d.phase, reason = d.reason, cause = d.cause, tStart = d.tStart, s0 = d.s0, kmh = d.kmh, order = order })
 end
 
-local ok, s, a = pcall(ac.OnlineEvent, {
-  ac.StructItem.key('ovalState8'),
-  seq = ac.StructItem.int32(),
-  tStart = ac.StructItem.int32(),
-  s0 = ac.StructItem.float(),
-  kmh = ac.StructItem.uint16(),
-  phase = ac.StructItem.uint8(),
-  reason = ac.StructItem.uint8(),
-  cause = ac.StructItem.uint8(),
-  n = ac.StructItem.uint8(),
-  order = ac.StructItem.array(ac.StructItem.uint8(), ORDER_MAX),
-}, onState)
+local ok, s, a = pcall(function()
+  return ac.OnlineEvent({
+    ac.StructItem.key('ovalState8'),
+    seq = ac.StructItem.int32(),
+    tStart = ac.StructItem.int32(),
+    s0 = ac.StructItem.float(),
+    kmh = ac.StructItem.uint16(),
+    phase = ac.StructItem.uint8(),
+    reason = ac.StructItem.uint8(),
+    cause = ac.StructItem.uint8(),
+    n = ac.StructItem.uint8(),
+    order = ac.StructItem.array(ac.StructItem.uint8(), ORDER_MAX),
+  }, onState)
+end)
 if ok then sendEvent, accessEvent = s, a else ac.log('Oval: online events unavailable: ' .. tostring(s)) end
 
 -- Puts a message into the shared buffer and queues it for everybody else.
@@ -131,7 +134,8 @@ end
 local function pacePos() return frac(S.s0 + S.kmh / 3.6 * (clock() - S.tStart) / 1000 / trackLen()) end
 
 local function ahead(a, b) -- is car a ahead of car b in the race
-  if a.racePosition > 0 and b.racePosition > 0 and a.racePosition ~= b.racePosition then return a.racePosition < b.racePosition end
+  local pa, pb = a.racePosition or 0, b.racePosition or 0
+  if pa > 0 and pb > 0 and pa ~= pb then return pa < pb end
   if S.seq == 0 and a.lapCount == 0 and b.lapCount == 0 then return frac(-a.splinePosition) < frac(-b.splinePosition) end -- on the grid: closest before the line
   return a.lapCount + a.splinePosition > b.lapCount + b.splinePosition
 end
@@ -345,19 +349,29 @@ local function guard(fn)
   end
 end
 
-local function isActive() return cfg.everySession == 1 or sim.raceSessionType == ac.SessionType.Race end
+local function sessionType()
+  local t = sim.raceSessionType
+  if t ~= nil then return t end
+  local good, sess = pcall(ac.getSession, sim.currentSessionIndex) -- older CSP: ask the session itself
+  return good and sess and sess.type or nil
+end
+local function isActive() return cfg.everySession == 1 or sessionType() == RACE end
 local function reset() S, L1, watch, ctl, start, greeted = freshState(), {}, {}, {}, {}, false end
 try('session start events', ac.onSessionStart, reset)
 
 -- Chat commands: !ovaldebug (anyone, only for yourself), !yellow / !green (admin)
-try('chat commands', ac.onOutgoingChatMessage, function(msg)
+local function command(msg)
   local cmd = msg:lower():match('^%s*!(%a+)%s*$')
   if cmd == 'ovaldebug' then debugOn = not debugOn return true end
   if (cmd ~= 'yellow' and cmd ~= 'green') or not isActive() then return false end
   if sim.isOnlineRace and not sim.isAdmin then return false end
   if cmd == 'yellow' then deploy(0, NONE) else release() end
   return true
-end)
+end
+if not try('chat commands', ac.onOutgoingChatMessage, command) then
+  -- older CSP cannot intercept what we type: react to our own message when it comes back (it stays visible in the chat)
+  try('chat commands from the incoming chat', ac.onChatMessage, function(msg, sender) if sender == 0 then command(msg) end end)
+end
 
 -- The session clock starts at 0 when the session is created, 30 s before the lights go out, so it
 -- says nothing about the start. Signals: the countdown of the game (timeToSessionStart) has run
@@ -381,7 +395,7 @@ local function startRace(cars, rank, now) -- lights out: the field follows the p
   if S.seq > 0 then start.done = true end
   if cfg.rolling ~= 1 or start.done or not lightsOut(cars, now) or not due('start', rank) then return end
   local list = {}
-  for id, c in pairs(cars) do list[#list + 1] = string.format('%d:p%d:%.4f', id, c.racePosition, c.splinePosition) end
+  for id, c in pairs(cars) do list[#list + 1] = string.format('%d:p%d:%.4f', id, c.racePosition or 0, c.splinePosition) end
   deploy(2, NONE)
   if S.seq > 0 then
     start.done = true
@@ -540,7 +554,7 @@ local function drawDebug()
   local ids = {}
   for id in pairs(presence) do ids[#ids + 1] = id end
   table.sort(ids)
-  ui.dwriteDrawText(string.format('CSP %s  race %s  direct %s  sent %d got %d stale %d  script on: %s', tostring(build), tostring(sim.raceSessionType), tostring(sim.directMessagingAvailable),
+  ui.dwriteDrawText(string.format('CSP %s  race %s  direct %s  sent %d got %d stale %d  script on: %s', tostring(build), tostring(sessionType()), tostring(sim.directMessagingAvailable),
     stats.sent, stats.got, stats.stale, table.concat(ids, ',')), 13, vec2(12, 74), yel)
 end
 
@@ -548,6 +562,9 @@ function script.drawUI()
   guard(function()
     local win = ui.windowSize()
     if uiTime < 20 then ui.dwriteDrawText(string.format('%s loaded (CSP %s)', VERSION, tostring(build)), 14, vec2(12, 8), rgbm(1, 1, 1, 0.8)) end
+    if lastError then
+      ui.dwriteDrawText(('OVAL error: ' .. tostring(lastError)):sub(1, 200), 14, vec2(12, 48), rgbm(1, 0.3, 0.3, 1))
+    end
     if not sendEvent and isActive() then
       ui.dwriteDrawText('OVAL: no online events, the flag will not reach you. Update Custom Shaders Patch.', 16, vec2(12, 30), rgbm(1, 0.3, 0.3, 1))
     end
@@ -591,7 +608,7 @@ function script.draw3D()
   guard(drawPaceCar)()
 end
 
-pcall(function() ac.log(string.format('Oval: %s loaded, CSP %s, me=%d cars=%d raceType=%s clock=%s events=%s', VERSION, tostring(build), ac.getCar(0).sessionID, sim.carsCount, tostring(sim.raceSessionType), tostring(clock()), tostring(sendEvent ~= nil))) end)
+pcall(function() ac.log(string.format('Oval: %s loaded, CSP %s, me=%d cars=%d raceType=%s clock=%s events=%s', VERSION, tostring(build), ac.getCar(0).sessionID, sim.carsCount, tostring(sessionType()), tostring(clock()), tostring(sendEvent ~= nil))) end)
 
 -- Offline tests load this file with a fake `ac` and read the internals from here.
 if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, stats = function() return stats end } end
