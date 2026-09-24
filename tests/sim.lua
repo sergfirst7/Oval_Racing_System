@@ -45,13 +45,15 @@ local function newEnv(client, cfgOverride)
     onOutgoingChatMessage = function(cb) client.chat = cb end,
     getDriverName = function(i) return 'car' .. i end,
     trackCoordinateToWorld = function() return dummy end,
-    log = function(m) W.errors[#W.errors + 1] = tostring(m) end,
+    log = function(m) if tostring(m):find('rror') or tostring(m):find('unavailable') then W.errors[#W.errors + 1] = tostring(m) end end,
+    onCarCollision = function(_, cb) client.hitcb = cb end,
     OnlineEvent = function(_, cb)
       local buf = { order = {} }
       client.cb = cb
       local function send(_, repeatForNew)
         if W.t - (client.lastSend or -1) < 0.2 then return false end -- vanilla acServer rate limit
         client.lastSend = W.t
+        W.sends = (W.sends or 0) + 1
         local msg = { order = {} }
         for k, v in pairs(buf) do if k ~= 'order' then msg[k] = v end end
         for i = 0, 47 do msg.order[i] = buf.order[i] end
@@ -135,9 +137,9 @@ local function step()
   for _, cl in ipairs(W.clients) do phaseOf[cl.car] = cl end
   for _, c in ipairs(W.cars) do
     if c.isConnected then
-      local cl = phaseOf[c]
-      local st = cl and cl.oval.state() or { phase = GREEN }
-      local pace = cl and st.phase == CAUTION and cl.oval.pacePos() or nil
+      local cl = phaseOf[c] or W.clients[1] -- a car without the script still obeys what its driver sees
+      local st = cl.oval.state()
+      local pace = st.phase == CAUTION and cl.oval.pacePos() or nil
       local want = target(c, st.phase, pace, 100) / 3.6
       local v = c.speedKmh / 3.6
       v = v < want and math.min(want, v + 5 * DT) or math.max(want, v - 10 * DT)
@@ -157,12 +159,14 @@ local function run(sec) for _ = 1, math.floor(sec / DT) do step() end end
 -- ── scenarios ────────────────────────────────────────────────────────────────
 local function check(cond, msg) if not cond then error('FAIL: ' .. msg, 2) end print('ok   ' .. msg) end
 
-local function field(n, gap, kmh, cfgOverride, adminId) -- n cars `gap` metres apart, one client per car
+local function field(n, gap, kmh, cfgOverride, adminId, noScript) -- n cars `gap` metres apart, one client per car
   resetWorld()
   for i = 1, n do addCar(i, 0.5 - (i - 1) * gap / TRACK, kmh) end
   local byId, initial = {}, {}
   for i, c in ipairs(W.cars) do initial[i], byId[c.sessionID] = c, c end
-  for _, c in ipairs(initial) do addClient(c, c.sessionID == adminId, cfgOverride) end
+  for _, c in ipairs(initial) do
+    if not (noScript and noScript[c.sessionID]) then addClient(c, c.sessionID == adminId, cfgOverride) end
+  end
   return byId
 end
 
@@ -268,8 +272,8 @@ local function scenarioAuto()
   local t0 = W.t
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
   local st = W.clients[1].oval.state()
-  check(st.reason == 1 and st.cause == 4, 'a car standing still calls the caution and is named as the cause')
-  check(W.t - t0 > 4 and W.t - t0 < 15, 'the caution comes after stopSec, not instantly (' .. string.format('%.1f', W.t - t0) .. ' s)')
+  check(st.reason == 1 and st.cause == 4 and st.from == 4, 'a car standing still calls the caution itself and is named as the cause')
+  check(W.t - t0 > 3 and W.t - t0 < 15, 'the caution comes after stopSec, not instantly (' .. string.format('%.1f', W.t - t0) .. ' s)')
   run(1)
   everyone(CAUTION, 'agrees on the caution')
 
@@ -288,6 +292,7 @@ local function scenarioAuto()
     check(table.concat(o, ',') == '1,2,3,5,6,7,8,9,10', 'client ' .. cl.car.sessionID .. ' order: recovered car dropped, returned car back in its own place (' .. table.concat(o, ',') .. ')')
   end
 
+  local sends0 = W.sends
   untilTrue(function() return W.clients[1].oval.state().phase == ONE_TO_GO end, 400, 'one to go')
   local order, prev, worst = W.clients[1].oval.state().order, nil, 0
   for _, id in ipairs(order) do
@@ -306,6 +311,7 @@ local function scenarioAuto()
   check(leaderSpline < 0.1, 'green comes when the leader crosses the line (spline ' .. string.format('%.3f', leaderSpline) .. ')')
   run(1)
   everyone(GREEN, 'is green')
+  check(W.sends - sends0 <= 6, 'the whole restart took ' .. (W.sends - sends0) .. ' messages, not one per client')
   check(not watch.dirty, 'compliant drivers were never warned during the whole caution' .. (watch.dirty and (': ' .. watch.dirty) or ''))
   byId[5].stopped = true -- stops again right after the restart
   run(18)
@@ -349,7 +355,56 @@ local function scenarioGiveUp()
   check(true, 'and the flag turns green')
 end
 
+local function scenarioWreck()
+  print('== a wreck calls the caution at once, a scrape does not')
+  local byId = field(8, 45, 200)
+  run(30)
+  byId[5].speedKmh = 185; W.clients[5].hitcb(0) -- brushes the wall and keeps going
+  run(5)
+  everyone(GREEN, 'a scrape that costs 15 km/h is no wreck')
+  byId[5].speedKmh = 185; W.clients[5].hitcb(0)
+  byId[5].speedKmh = 45 -- the same hit, but the car is nearly stopped
+  local t0 = W.t
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 5, 'the wreck caution')
+  local st = W.clients[1].oval.state()
+  check(st.reason == 3 and st.cause == 5 and st.from == 5 and W.t - t0 < 1.5, 'the wreck is reported by the car itself within a moment (' .. string.format('%.1f', W.t - t0) .. ' s)')
+end
+
+local function scenarioGrid()
+  print('== a car that never got up to speed is no incident')
+  local byId = field(6, 20, 0)
+  for _, c in pairs(byId) do c.stopped = true end -- everybody sits on the grid past the grace time
+  run(45)
+  everyone(GREEN, 'a whole grid standing still calls no caution')
+  for _, c in pairs(byId) do c.stopped, c.cruise = false, 150 end
+  run(20)
+  byId[3].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution after the start')
+  check(W.clients[1].oval.state().cause == 3, 'but a car that stops after racing does')
+end
+
+local function scenarioNoScript()
+  print('== the lowest session id has no script')
+  local byId = field(8, 45, 200, nil, nil, { [1] = true })
+  run(30)
+  byId[4].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  check(W.clients[1].oval.state().from == 4, 'the caution comes although the controller-to-be runs nothing')
+  byId[4].isInPitlane = true
+  byId[6].isInPitlane = true
+  run(6)
+  byId[6].isInPitlane = false
+  run(6)
+  check(table.concat(W.clients[1].oval.state().order, ',') == '1,2,3,5,6,7,8', 'the order is kept up by the next client in line (' .. table.concat(W.clients[1].oval.state().order, ',') .. ')')
+  untilTrue(function() return W.clients[1].oval.state().phase == ONE_TO_GO end, 400, 'one to go')
+  untilTrue(function() return W.clients[1].oval.state().phase == GREEN end, 200, 'the green flag')
+  check(true, 'one to go and green happen too')
+end
+
 scenarioManual()
+scenarioWreck()
+scenarioGrid()
+scenarioNoScript()
 scenarioAuto()
 scenarioGiveUp()
 scenarioStraggler()
