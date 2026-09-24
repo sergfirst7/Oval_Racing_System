@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 9.1'
+local VERSION = 'Oval 9.4'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -25,7 +25,7 @@ local cfgDefaults = {
   passSec = 1.2,       -- being ahead of the car in front for this long is a violation
   strikeGapSec = 8,    -- the same violation is counted at most once per this many seconds
   slowSec = 5,         -- length of the gas cut penalty
-  driveLaps = 3,       -- laps the game gives to serve a drive-through (it counts them from the green flag, when it is handed out)
+  driveLaps = 3,       -- laps the game gets to serve a drive-through ('drive' only)
   rolling = 1,         -- 1: the race starts behind the pace car (rolling start); 0: standing start
   formationLaps = 1,   -- pace laps of the rolling start before the field may go green
   startLeadM = 40,     -- how far ahead of pole position the pace car starts
@@ -171,11 +171,20 @@ local function release() commit(GREEN, 0, NONE, clock(), 0, {}) end
 
 -- ── penalties ────────────────────────────────────────────────────────────────
 -- Every client judges its own car. Violations are counted per pace car deployment: the first one
--- is a warning, the second cuts the gas, from the third on a drive-through is due (unless one is
--- still pending). Passing the pace car and jumping the restart count double.
+-- is a warning, the second cuts the gas, from the third on the gas is cut again (in the experimental
+-- 'drive' mode a drive-through is due instead). Passing the pace car and jumping the restart count double.
 local function setPenalty(kind, param)
   local good, err = pcall(function() physics.setCarPenalty(ac.PenaltyType[kind], param) end)
   if not good then ac.log('Oval: penalty ' .. kind .. ' could not be applied: ' .. tostring(err)) end
+  return good
+end
+
+-- The gas cut is done by the script itself, not with the game's SlowDown penalty: that one adds
+-- penalty time (log: `Adding penalty PT`) which was never served, and at the next lap completed
+-- the car got the black flag and ended up in the pits.
+local function cutGas(seconds)
+  local good, err = pcall(function() physics.forceUserThrottleFor(seconds, 0) end)
+  if not good then ac.log('Oval: gas cut could not be applied: ' .. tostring(err)) end
   return good
 end
 
@@ -185,15 +194,14 @@ local function penalize(why, weight)
   local level, title, applied = pen.strikes, 'WARNING', true
   if cfg.penalty ~= 'off' and level >= 2 then
     if cfg.penalty == 'drive' and level >= 3 and not pen.owed and not pen.driving then
-      -- The game counts the laps to serve it from the moment it is handed out, and a caution is over
-      -- in about a lap: handed out then, it would run out before the field can serve it (black flag,
-      -- teleport to the pits). So it is handed out when the race is green again.
+      -- Handed out only when the race is green again: a caution is over in about a lap, too soon
+      -- to serve it. Verified in the game: it is served by a run through the pit lane.
       title, pen.owed = 'DRIVE-THROUGH AFTER THE GREEN', true
     elseif uiTime - (pen.slowAt or -100) < cfg.slowSec + 3 then
       title = 'GAS CUT (ALREADY ACTIVE)' -- a running gas cut is not extended
     else
       title = 'GAS CUT ' .. cfg.slowSec .. ' S'
-      applied = setPenalty('SlowDown', cfg.slowSec)
+      applied = cutGas(cfg.slowSec)
       if applied then pen.slowAt = uiTime end
     end
   end
@@ -230,7 +238,8 @@ local function handOutOwed()
   local title = 'DRIVE-THROUGH PENALTY' .. (applied and '' or ' (NOT ENFORCED)')
   penNote = { title = title, why = 'Enter the pit lane now', untilT = uiTime + 7 }
   pcall(ac.setMessage, title, 'Enter the pit lane now', 'illegal', 7)
-  ac.log('Oval: ' .. title .. ' handed out after the green flag')
+  local me = ac.getCar(0)
+  ac.log(string.format('Oval: %s handed out after the green flag (lap %s, track position %.3f)', title, tostring(me.lapCount), me.splinePosition))
 end
 
 -- a drive-through is served once the car has been through the pit lane
@@ -238,6 +247,25 @@ local function servePenalty(me)
   if not pen.driving then return end
   if me.isInPitlane then pen.pitSeen = true
   elseif pen.pitSeen then pen.driving = false; ac.log('Oval: drive-through served') end
+end
+
+-- What the game itself does with our penalties goes to the log (type / laps left / lap / pit lane),
+-- so its counting of a drive-through can be read off. A car that got the black flag for a
+-- drive-through we handed out is set free: the driver must not end up parked in the pits for good.
+local gamePen = ''
+local function watchGamePenalty(me)
+  local good, kind, param = pcall(function() return me.currentPenaltyType, me.currentPenaltyParameter end) -- fields of the car, not of ac.getSim()
+  if not good then return end
+  local key = string.format('%s/%s lap %s pit %s', tostring(kind), tostring(param), tostring(me.lapCount), tostring(me.isInPitlane))
+  if key ~= gamePen then gamePen = key; ac.log('Oval: game penalty ' .. key) end
+  local black = ac.PenaltyType and ac.PenaltyType.BlackFlag
+  if pen.driving and black and kind == black then
+    pen.driving = false
+    local applied = setPenalty('ReleaseBlackFlag')
+    penNote = { title = 'BLACK FLAG RELEASED', why = 'Drive-through not served', untilT = uiTime + 7 }
+    pcall(ac.setMessage, penNote.title, penNote.why, 'illegal', 7)
+    ac.log('Oval: black flag after a drive-through, released (applied=' .. tostring(applied) .. ')')
+  end
 end
 
 -- ── rules for the local car ──────────────────────────────────────────────────
@@ -618,6 +646,7 @@ function script.update(dt)
     localCheck(cars, dt)
     servePenalty(me)
     handOutOwed()
+    watchGamePenalty(me)
     updatePaceCar()
   end)()
 end
@@ -707,6 +736,8 @@ function script.draw3D()
 end
 
 pcall(function() ac.log(string.format('Oval: %s loaded, CSP %s, me=%d cars=%d raceType=%s clock=%s events=%s penalty=%s', VERSION, tostring(build), ac.getCar(0).sessionID, sim.carsCount, tostring(sessionType()), tostring(clock()), tostring(sendEvent ~= nil), cfg.penalty)) end)
+-- a timed race has no lap count, which may be why the game cannot count the laps of a drive-through
+pcall(function() local s = ac.getSession(sim.currentSessionIndex); ac.log(string.format('Oval: session laps=%s timed=%s minutes=%s', tostring(s.laps), tostring(s.isTimedRace), tostring(s.durationMinutes))) end)
 
 -- Offline tests load this file with a fake `ac` and read the internals from here.
 if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, pen = function() return pen end, note = function() return penNote end, stats = function() return stats end } end
