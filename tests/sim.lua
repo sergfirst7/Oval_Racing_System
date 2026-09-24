@@ -4,12 +4,13 @@
 -- fake bus with latency and the 200 ms rate limit of a vanilla acServer.
 
 local TRACK, DT, LATENCY = 2500, 1 / 30, 0.1
-local GREEN, CAUTION = 0, 1
+local GREEN, CAUTION, ONE_TO_GO = 0, 1, 2
 
 local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
 local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {} } -- t in seconds
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup = 0, {}, {}, {}, 60 end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
 local dummy
@@ -18,7 +19,7 @@ local function noop() end
 
 local function newEnv(client, cfgOverride)
   local car = client.car
-  local sim = { carsCount = #W.cars, trackLengthM = TRACK, currentSessionTime = 0, raceSessionType = 3, isOnlineRace = true, isAdmin = client.admin }
+  local sim = { carsCount = #W.cars, trackLengthM = TRACK, currentSessionTime = 0, raceSessionType = 3, isSessionStarted = true, isOnlineRace = true, isAdmin = client.admin }
   client.sim = sim
   local env = setmetatable({ OVAL_TEST = true, script = {}, math = math, string = string, table = table, pairs = pairs, ipairs = ipairs,
     pcall = pcall, tostring = tostring, type = type, next = next, setmetatable = setmetatable }, { __index = function(_, k) return rawget(_G, k) end })
@@ -44,13 +45,15 @@ local function newEnv(client, cfgOverride)
     onOutgoingChatMessage = function(cb) client.chat = cb end,
     getDriverName = function(i) return 'car' .. i end,
     trackCoordinateToWorld = function() return dummy end,
-    log = function(m) W.errors[#W.errors + 1] = tostring(m) end,
+    log = function(m) if tostring(m):find('rror') or tostring(m):find('unavailable') then W.errors[#W.errors + 1] = tostring(m) end end,
+    onCarCollision = function(_, cb) client.hitcb = cb end,
     OnlineEvent = function(_, cb)
       local buf = { order = {} }
       client.cb = cb
       local function send(_, repeatForNew)
         if W.t - (client.lastSend or -1) < 0.2 then return false end -- vanilla acServer rate limit
         client.lastSend = W.t
+        W.sends = (W.sends or 0) + 1
         local msg = { order = {} }
         for k, v in pairs(buf) do if k ~= 'order' then msg[k] = v end end
         for i = 0, 47 do msg.order[i] = buf.order[i] end
@@ -102,7 +105,9 @@ local function disconnect(client) client.connected, client.car.isConnected, clie
 
 -- A driver who follows the rules: closes gaps like a human would, never above the limit.
 local function target(car, phase, pace, paceKmh)
+  if car.stopped then return 0 end
   if phase == GREEN or car.ignore then return car.cruise end
+  if phase == ONE_TO_GO then return paceKmh - 4 end
   local gap, aheadKmh = TRACK, paceKmh
   for _, o in ipairs(W.cars) do
     if o ~= car and o.isConnected and not o.isInPitlane then
@@ -110,9 +115,9 @@ local function target(car, phase, pace, paceKmh)
       if g < gap then gap, aheadKmh = g, o.speedKmh end
     end
   end
-  local g = frac(pace - car.splinePosition) * TRACK
+  local g = pace and frac(pace - car.splinePosition) * TRACK or TRACK
   if g < gap then gap, aheadKmh = g, paceKmh end
-  local t = paceKmh + 60 * clamp((gap - 30) / 120, 0, 1) - 4
+  local t = paceKmh + W.catchup * clamp((gap - 30) / 120, 0, 1) - 4
   if gap < 20 then t = math.min(t, aheadKmh - 10) end
   return t
 end
@@ -132,9 +137,9 @@ local function step()
   for _, cl in ipairs(W.clients) do phaseOf[cl.car] = cl end
   for _, c in ipairs(W.cars) do
     if c.isConnected then
-      local cl = phaseOf[c]
-      local st = cl and cl.oval.state() or { phase = GREEN }
-      local pace = cl and st.phase == CAUTION and cl.oval.pacePos() or 0
+      local cl = phaseOf[c] or W.clients[1] -- a car without the script still obeys what its driver sees
+      local st = cl.oval.state()
+      local pace = st.phase == CAUTION and cl.oval.pacePos() or nil
       local want = target(c, st.phase, pace, 100) / 3.6
       local v = c.speedKmh / 3.6
       v = v < want and math.min(want, v + 5 * DT) or math.max(want, v - 10 * DT)
@@ -151,87 +156,257 @@ end
 
 local function run(sec) for _ = 1, math.floor(sec / DT) do step() end end
 
--- ── scenario ─────────────────────────────────────────────────────────────────
+-- ── scenarios ────────────────────────────────────────────────────────────────
 local function check(cond, msg) if not cond then error('FAIL: ' .. msg, 2) end print('ok   ' .. msg) end
 
--- 8 cars, 45 m apart at 200 km/h, plus one straggler 600 m back; car 5 is the admin.
-for i = 1, 8 do addCar(i, 0.5 - (i - 1) * 45 / TRACK, 200) end
-addCar(9, 0.5 - 600 / TRACK, 200)
-local byId = {}
-for _, c in ipairs(W.cars) do byId[c.sessionID] = c end
-local initial = {}
-for i, c in ipairs(W.cars) do initial[i] = c end
-for _, c in ipairs(initial) do addClient(c, c.sessionID == 5) end
-local admin = 5 -- client index equals session id here
-
-run(10)
-check(W.clients[1].oval.state().phase == GREEN, 'starts green')
-
-check(W.clients[admin].chat('!yellow') == true, 'admin !yellow is handled (kept out of chat)')
-check(W.clients[1].chat('!yellow') == false, 'non-admin !yellow is left alone')
-run(1)
-local ref = W.clients[1].oval.state()
-check(ref.phase == CAUTION and #ref.order == 9, 'caution with 9 cars in order')
-for _, cl in ipairs(W.clients) do
-  local s = cl.oval.state()
-  check(s.seq == ref.seq and s.s0 == ref.s0 and s.tStart == ref.tStart and s.phase == CAUTION and #s.order == 9,
-    'client ' .. cl.car.sessionID .. ' shares the same state')
-end
-for _, cl in ipairs(W.clients) do
-  check(math.abs(cl.oval.pacePos() - W.clients[1].oval.pacePos()) < 1e-9, 'pace car position equal on client ' .. cl.car.sessionID)
+local function field(n, gap, kmh, cfgOverride, adminId, noScript) -- n cars `gap` metres apart, one client per car
+  resetWorld()
+  for i = 1, n do addCar(i, 0.5 - (i - 1) * gap / TRACK, kmh) end
+  local byId, initial = {}, {}
+  for i, c in ipairs(W.cars) do initial[i], byId[c.sessionID] = c, c end
+  for _, c in ipairs(initial) do
+    if not (noScript and noScript[c.sessionID]) then addClient(c, c.sessionID == adminId, cfgOverride) end
+  end
+  return byId
 end
 
--- obedient field: after the deployment window nobody triggers a warning
-byId[3].ignore = true -- a rule breaker
-local bad = { speeding = false, passing = false }
-local clean = true
-for i = 1, math.floor(150 / DT) do
-  step()
-  if W.t > 22 then
-    for _, cl in ipairs(W.clients) do
-      local l = cl.oval.local1()
-      if cl.car.sessionID == 3 then
-        bad.speeding = bad.speeding or l.speeding or false
-        bad.passing = bad.passing or l.passing or false
-      elseif l.speeding or l.passing then clean = false end
+local function untilTrue(cond, maxSec, msg)
+  for _ = 1, math.floor(maxSec / DT) do
+    if cond() then return end
+    step()
+  end
+  error('FAIL: timed out waiting for ' .. msg, 2)
+end
+
+local function everyone(phase, msg)
+  for _, cl in ipairs(W.clients) do
+    if cl.connected then check(cl.oval.state().phase == phase, 'client ' .. cl.car.sessionID .. ' ' .. msg) end
+  end
+end
+
+-- Compliant drivers may see a warning for a moment (a car merged in front of them) but never for
+-- longer than they need to react: this is the window a penalty rule would allow.
+local function watchClean(state, sinceSec)
+  state.since = state.since or {}
+  for _, cl in ipairs(W.clients) do
+    local l, id = cl.oval.local1(), cl.car.sessionID
+    if cl.connected and W.t > sinceSec and (l.speeding or l.passing) and not cl.car.ignore then
+      state.since[id] = state.since[id] or W.t
+      if W.t - state.since[id] > 1.5 then state.dirty = state.dirty or ('client ' .. id .. ' warned for over 1.5 s at t=' .. math.floor(W.t)) end
+    else
+      state.since[id] = nil
     end
   end
 end
-check(clean, 'compliant drivers never see SLOW DOWN / DO NOT PASS after the first 10 s')
-check(bad.speeding, 'rule breaker gets SLOW DOWN')
-check(bad.passing, 'rule breaker gets DO NOT PASS once ahead of the car in front')
 
--- late joiner receives the current state; the sender leaving does not lose it
-local late = addCar(10, 0.2, 100)
-disconnect(W.clients[admin])
-run(2)
-local lateClient = addClient(late, false)
-run(1)
-check(lateClient.oval.state().phase == CAUTION, 'late joiner gets the caution from a re-announcing controller')
-check(lateClient.oval.state().seq > ref.seq, 're-announcement bumped the sequence')
-
--- admin releases
-local admin2 = W.clients[1]
-admin2.admin, admin2.sim.isAdmin = true, true
-check(admin2.chat('!green') == true, '!green handled')
-run(1)
-for _, cl in ipairs(W.clients) do
-  if cl.connected then check(cl.oval.state().phase == GREEN, 'client ' .. cl.car.sessionID .. ' is green again') end
-end
-
--- two admins call a caution at the very same moment: everybody must end up with one state
-W.clients[6].admin, W.clients[6].sim.isAdmin = true, true
-W.clients[1].chat('!yellow'); W.clients[6].chat('!yellow')
-run(1)
-local first
-for _, cl in ipairs(W.clients) do
-  if cl.connected then
+local function scenarioManual()
+  print('== manual flags')
+  local noRestart = { cautionLaps = 99, maxCautionLaps = 99 }
+  -- 8 cars 45 m apart at 200 km/h plus a straggler 600 m back; car 5 is the admin.
+  local byId = field(8, 45, 200, noRestart, 5)
+  local straggler = addCar(9, 0.5 - 600 / TRACK, 200)
+  addClient(straggler, false, noRestart)
+  local admin = 5
+  run(10)
+  check(W.clients[1].oval.state().phase == GREEN, 'starts green')
+  check(W.clients[admin].chat('!yellow') == true, 'admin !yellow is handled (kept out of chat)')
+  check(W.clients[1].chat('!yellow') == false, 'non-admin !yellow is left alone')
+  run(1)
+  local ref = W.clients[1].oval.state()
+  check(ref.phase == CAUTION and #ref.order == 9, 'caution with 9 cars in order')
+  for _, cl in ipairs(W.clients) do
     local st = cl.oval.state()
-    first = first or st
-    check(st.seq == first.seq and st.from == first.from and st.phase == CAUTION, 'client ' .. cl.car.sessionID .. ' converged after a simultaneous call')
+    check(st.seq == ref.seq and st.s0 == ref.s0 and st.tStart == ref.tStart and st.phase == CAUTION and #st.order == 9,
+      'client ' .. cl.car.sessionID .. ' shares the same state')
+    check(math.abs(cl.oval.pacePos() - W.clients[1].oval.pacePos()) < 1e-9, 'pace car position equal on client ' .. cl.car.sessionID)
   end
-end
-check(first.from == 1, 'the lowest session id wins the tie')
 
+  byId[3].ignore = true -- a rule breaker
+  local bad, watch = { speeding = false, passing = false }, {}
+  for _ = 1, math.floor(150 / DT) do
+    step()
+    watchClean(watch, 22)
+    local l = W.clients[3].oval.local1()
+    bad.speeding, bad.passing = bad.speeding or l.speeding or false, bad.passing or l.passing or false
+  end
+  check(not watch.dirty, 'compliant drivers never see SLOW DOWN / DO NOT PASS after the first 10 s' .. (watch.dirty and (': ' .. watch.dirty) or ''))
+  check(bad.speeding, 'rule breaker gets SLOW DOWN')
+  check(bad.passing, 'rule breaker gets DO NOT PASS once ahead of the car in front')
+
+  -- a late joiner still gets the state after the sender has left
+  local late = addCar(10, 0.2, 100)
+  disconnect(W.clients[admin])
+  run(2)
+  local lateClient = addClient(late, false, noRestart)
+  run(1)
+  check(lateClient.oval.state().phase == CAUTION, 'late joiner gets the caution from a re-announcing controller')
+  check(lateClient.oval.state().seq > ref.seq, 're-announcement bumped the sequence')
+
+  W.clients[1].admin, W.clients[1].sim.isAdmin = true, true
+  check(W.clients[1].chat('!green') == true, '!green handled')
+  run(1)
+  everyone(GREEN, 'is green again')
+
+  -- two admins call a caution at the very same moment: everybody must end up with one state
+  W.clients[6].admin, W.clients[6].sim.isAdmin = true, true
+  W.clients[1].chat('!yellow'); W.clients[6].chat('!yellow')
+  run(1)
+  local first
+  for _, cl in ipairs(W.clients) do
+    if cl.connected then
+      local st = cl.oval.state()
+      first = first or st
+      check(st.seq == first.seq and st.from == first.from and st.phase == CAUTION, 'client ' .. cl.car.sessionID .. ' converged after a simultaneous call')
+    end
+  end
+  check(first.from == 1, 'the lowest session id wins the tie')
+end
+
+local function scenarioAuto()
+  print('== automatic caution, bunching, restart')
+  local byId = field(10, 45, 200)
+  run(30)
+  everyone(GREEN, 'stays green while everybody races')
+
+  byId[4].stopped = true
+  local t0 = W.t
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  local st = W.clients[1].oval.state()
+  check(st.reason == 1 and st.cause == 4 and st.from == 4, 'a car standing still calls the caution itself and is named as the cause')
+  check(W.t - t0 > 3 and W.t - t0 < 15, 'the caution comes after stopSec, not instantly (' .. string.format('%.1f', W.t - t0) .. ' s)')
+  run(1)
+  everyone(CAUTION, 'agrees on the caution')
+
+  local watch, cautionAt = {}, W.t
+  local function runClean(sec) for _ = 1, math.floor(sec / DT) do step(); watchClean(watch, cautionAt + 12) end end
+  runClean(15)
+  check(W.clients[1].oval.state().phase == CAUTION, 'no restart while the stopped car is still on track')
+  byId[4].isInPitlane = true -- it was recovered
+  runClean(10)
+  byId[6].isInPitlane = true -- another car pits and comes back
+  runClean(10)
+  byId[6].isInPitlane = false
+  runClean(4)
+  for _, cl in ipairs(W.clients) do
+    local o = cl.oval.state().order
+    check(table.concat(o, ',') == '1,2,3,5,6,7,8,9,10', 'client ' .. cl.car.sessionID .. ' order: recovered car dropped, returned car back in its own place (' .. table.concat(o, ',') .. ')')
+  end
+
+  local sends0 = W.sends
+  untilTrue(function() return W.clients[1].oval.state().phase == ONE_TO_GO end, 400, 'one to go')
+  local order, prev, worst = W.clients[1].oval.state().order, nil, 0
+  for _, id in ipairs(order) do
+    if prev then worst = math.max(worst, frac(prev.splinePosition - byId[id].splinePosition) * TRACK) end
+    prev = byId[id]
+  end
+  print(string.format('     one to go after %.0f s of caution, widest gap in the pack %.0f m', W.t - cautionAt, worst))
+  check(W.t - cautionAt > 100, 'at least cautionLaps pace laps first')
+  check(worst < 60, 'the field is bunched when one to go is shown')
+  runClean(1)
+  everyone(ONE_TO_GO, 'shows one to go')
+
+  untilTrue(function() return W.clients[1].oval.state().phase == GREEN end, 200, 'the green flag')
+  local leaderSpline
+  leaderSpline = byId[order[1]].splinePosition
+  check(leaderSpline < 0.1, 'green comes when the leader crosses the line (spline ' .. string.format('%.3f', leaderSpline) .. ')')
+  run(1)
+  everyone(GREEN, 'is green')
+  check(W.sends - sends0 <= 6, 'the whole restart took ' .. (W.sends - sends0) .. ' messages, not one per client')
+  check(not watch.dirty, 'compliant drivers were never warned during the whole caution' .. (watch.dirty and (': ' .. watch.dirty) or ''))
+  byId[5].stopped = true -- stops again right after the restart
+  run(18)
+  everyone(GREEN, 'stays green during the cooldown although a car is standing')
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the next caution')
+  check(W.clients[1].oval.state().cause == 5, 'the next caution comes after the cooldown')
+end
+
+local function scenarioStraggler()
+  print('== the restart waits for the field to bunch up')
+  local byId = field(8, 45, 200, { cautionLaps = 1, catchupKmh = 20 })
+  W.catchup = 20
+  local straggler = addCar(9, 0.5 - 8 * 45 / TRACK - 1200 / TRACK, 200)
+  addClient(straggler, false, { cautionLaps = 1, catchupKmh = 20 })
+  run(30)
+  byId[1].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  local at = W.t
+  byId[1].isInPitlane = true
+  untilTrue(function() return W.clients[2].oval.state().phase == ONE_TO_GO end, 900, 'one to go')
+  local prev, worst = nil, 0
+  for _, id in ipairs(W.clients[2].oval.state().order) do
+    local c = id == 9 and straggler or byId[id]
+    if prev then worst = math.max(worst, frac(prev.splinePosition - c.splinePosition) * TRACK) end
+    prev = c
+  end
+  print(string.format('     one to go after %.0f s of caution, widest gap %.0f m', W.t - at, worst))
+  check(W.t - at > 220 and worst < 90, 'one to go only after the straggler caught up, although one pace lap had passed long before')
+end
+
+local function scenarioGiveUp()
+  print('== a hazard that never clears')
+  local byId = field(6, 45, 200, { cautionLaps = 1, maxCautionLaps = 2 })
+  run(30)
+  byId[3].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  local at = W.t
+  untilTrue(function() return W.clients[1].oval.state().phase == ONE_TO_GO end, 400, 'one to go')
+  check(W.t - at > 170, 'a car standing on track holds the restart until maxCautionLaps (' .. math.floor(W.t - at) .. ' s)')
+  untilTrue(function() return W.clients[1].oval.state().phase == GREEN end, 200, 'the green flag')
+  check(true, 'and the flag turns green')
+end
+
+local function scenarioWreck()
+  print('== a wreck calls the caution at once, a scrape does not')
+  local byId = field(8, 45, 200)
+  run(30)
+  byId[5].speedKmh = 185; W.clients[5].hitcb(0) -- brushes the wall and keeps going
+  run(5)
+  everyone(GREEN, 'a scrape that costs 15 km/h is no wreck')
+  byId[5].speedKmh = 185; W.clients[5].hitcb(0)
+  byId[5].speedKmh = 45 -- the same hit, but the car is nearly stopped
+  local t0 = W.t
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 5, 'the wreck caution')
+  local st = W.clients[1].oval.state()
+  check(st.reason == 3 and st.cause == 5 and st.from == 5 and W.t - t0 < 1.5, 'the wreck is reported by the car itself within a moment (' .. string.format('%.1f', W.t - t0) .. ' s)')
+end
+
+local function scenarioGrid()
+  print('== a car that never got up to speed is no incident')
+  local byId = field(6, 20, 0)
+  for _, c in pairs(byId) do c.stopped = true end -- everybody sits on the grid past the grace time
+  run(45)
+  everyone(GREEN, 'a whole grid standing still calls no caution')
+  for _, c in pairs(byId) do c.stopped, c.cruise = false, 150 end
+  run(20)
+  byId[3].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution after the start')
+  check(W.clients[1].oval.state().cause == 3, 'but a car that stops after racing does')
+end
+
+local function scenarioNoScript()
+  print('== the lowest session id has no script')
+  local byId = field(8, 45, 200, nil, nil, { [1] = true })
+  run(30)
+  byId[4].stopped = true
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
+  check(W.clients[1].oval.state().from == 4, 'the caution comes although the controller-to-be runs nothing')
+  byId[4].isInPitlane = true
+  byId[6].isInPitlane = true
+  run(6)
+  byId[6].isInPitlane = false
+  run(6)
+  check(table.concat(W.clients[1].oval.state().order, ',') == '1,2,3,5,6,7,8', 'the order is kept up by the next client in line (' .. table.concat(W.clients[1].oval.state().order, ',') .. ')')
+  untilTrue(function() return W.clients[1].oval.state().phase == ONE_TO_GO end, 400, 'one to go')
+  untilTrue(function() return W.clients[1].oval.state().phase == GREEN end, 200, 'the green flag')
+  check(true, 'one to go and green happen too')
+end
+
+scenarioManual()
+scenarioWreck()
+scenarioGrid()
+scenarioNoScript()
+scenarioAuto()
+scenarioGiveUp()
+scenarioStraggler()
 check(#W.errors == 0, 'no script errors' .. (W.errors[1] and (': ' .. W.errors[1]) or ''))
 print('all good')
