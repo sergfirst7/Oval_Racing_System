@@ -351,11 +351,12 @@ local function scenarioAuto()
   everyone(GREEN, 'is green')
   check(W.sends - sends0 <= 6, 'the whole restart took ' .. (W.sends - sends0) .. ' messages, not one per client')
   check(not watch.dirty, 'compliant drivers were never warned during the whole caution' .. (watch.dirty and (': ' .. watch.dirty) or ''))
+  local greenAt = W.t
   byId[5].stopped = true -- stops again right after the restart
-  run(18)
-  everyone(GREEN, 'stays green during the cooldown although a car is standing')
+  run(2)
+  everyone(GREEN, 'stays green during the short cooldown although a car is standing')
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the next caution')
-  check(W.clients[1].oval.state().cause == 5, 'the next caution comes after the cooldown')
+  check(W.clients[1].oval.state().cause == 5 and W.t - greenAt > 4, 'the next caution comes after the cooldown (' .. string.format('%.1f', W.t - greenAt) .. ' s)')
 end
 
 local function scenarioStraggler()
@@ -394,18 +395,54 @@ local function scenarioGiveUp()
 end
 
 local function scenarioWreck()
-  print('== a wreck calls the caution at once, a scrape does not')
-  local byId = field(8, 45, 200)
+  print('== a wreck calls the caution at once, a scrape or hard braking does not')
+  local byId = field(8, 45, 250)
   run(30)
-  byId[5].speedKmh = 185; W.clients[5].hitcb(0) -- brushes the wall and keeps going
+  byId[5].speedKmh = 235; W.clients[5].hitcb(0) -- brushes the wall and keeps going
   run(5)
   everyone(GREEN, 'a scrape that costs 15 km/h is no wreck')
-  byId[5].speedKmh = 185; W.clients[5].hitcb(0)
-  byId[5].speedKmh = 45 -- the same hit, but the car is nearly stopped
+  byId[5].speedKmh, byId[5].cruise = 250, 190 -- braking hard for something: 60 km/h in under two seconds
+  run(6)
+  everyone(GREEN, 'hard braking is no wreck')
+  byId[5].cruise = 250
+  run(8)
+  byId[5].speedKmh = 210 -- a jolt of 40 km/h without any contact event
+  run(3)
+  everyone(GREEN, 'a 40 km/h jolt without a contact is no wreck')
+  byId[5].speedKmh = 250; W.clients[5].hitcb(0)
+  byId[5].speedKmh, byId[5].cruise = 140, 140 -- a hard hit that leaves the car rolling at 140 km/h
   local t0 = W.t
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 5, 'the wreck caution')
   local st = W.clients[1].oval.state()
-  check(st.reason == 3 and st.cause == 5 and st.from == 5 and W.t - t0 < 1.5, 'the wreck is reported by the car itself within a moment (' .. string.format('%.1f', W.t - t0) .. ' s)')
+  check(st.reason == 3 and st.cause == 5 and st.from == 5 and W.t - t0 < 1.5, 'a hit that keeps the car at 140 km/h is a wreck, reported by the car itself (' .. string.format('%.1f', W.t - t0) .. ' s)')
+
+  print('== the contact event is not needed')
+  byId = field(8, 45, 250)
+  run(30)
+  byId[4].speedKmh, byId[4].cruise = 120, 120 -- 130 km/h lost in a moment, no contact callback at all
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 5, 'the caution without a contact event')
+  check(W.clients[1].oval.state().reason == 3 and W.clients[1].oval.state().cause == 4, 'a sudden loss of speed alone is enough')
+
+  print('== a limping car')
+  byId = field(8, 45, 250)
+  run(30)
+  byId[6].cruise = 90 -- dragging along the wall at 90 km/h
+  local t1 = W.t
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution for the limping car')
+  check(W.clients[1].oval.state().reason == 1 and W.clients[1].oval.state().cause == 6, 'a car far below its own speed is stopped, not only one that stands (' .. string.format('%.1f', W.t - t1) .. ' s)')
+
+  print('== a wreck right after the green flag')
+  byId = field(8, 45, 250, nil, 1)
+  run(30)
+  W.clients[1].chat('!yellow')
+  run(2)
+  W.clients[1].chat('!green')
+  local greenAt = W.t
+  for _, c in pairs(byId) do c.cruise = 250 end
+  run(5) -- the cooldown is 4 s
+  byId[3].speedKmh, byId[3].cruise = 90, 90
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 5, 'the caution right after the restart')
+  check(W.clients[1].oval.state().reason == 3 and W.t - greenAt < 8, 'a wreck a few seconds after the green flag is covered too (' .. string.format('%.1f', W.t - greenAt) .. ' s)')
 end
 
 local function scenarioGrid()
@@ -437,8 +474,10 @@ local function scenarioRolling(useCountdown)
   W.defaults.rolling, W.hold, W.tts, W.clockOffset = 1, true, useCountdown, 6 -- the session clock is already running during the lights
   local byId = grid(10)
   W.t = -6
-  run(5.5)
-  everyone(GREEN, 'the field waits while the lights count down, the pace car does not leave early')
+  run(1)
+  byId[3].speedKmh = 40 -- cars jump to the grid at the start of the session: a speed spike, not a start
+  run(4.5)
+  everyone(GREEN, 'the field waits while the lights count down, a speed spike from the grid teleport is no start')
   check(W.clients[1].oval.state().seq == 0, 'nothing was sent during the countdown')
   local watch = {}
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 6, 'the rolling start')
