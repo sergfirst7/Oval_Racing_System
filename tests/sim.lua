@@ -10,9 +10,24 @@ local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
 local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {} } -- t in seconds
-local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0 end
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0, false end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
+local V = {}
+V.__index = V
+local function vec3(x, y, z) return setmetatable({ x = x or 0, y = y or 0, z = z or 0 }, V) end
+V.__add = function(a, b) return vec3(a.x + b.x, a.y + b.y, a.z + b.z) end
+V.__sub = function(a, b) return vec3(a.x - b.x, a.y - b.y, a.z - b.z) end
+V.__mul = function(a, k) if type(a) == 'number' then a, k = k, a end return vec3(a.x * k, a.y * k, a.z * k) end
+function V:clone() return vec3(self.x, self.y, self.z) end
+function V:normalize() local l = math.sqrt(self.x ^ 2 + self.y ^ 2 + self.z ^ 2); self.x, self.y, self.z = self.x / l, self.y / l, self.z / l; return self end
+function V:cross(o) local x, y, z = self.y * o.z - self.z * o.y, self.z * o.x - self.x * o.z, self.x * o.y - self.y * o.x; self.x, self.y, self.z = x, y, z; return self end
+local function dot(a, b) return a.x * b.x + a.y * b.y + a.z * b.z end
+local R = TRACK / (2 * math.pi)
+local function roadPoint(v) -- track coordinates -> world: a circle, x is the distance to the right (outwards)
+  local a = 2 * math.pi * v.z
+  return vec3((R + v.x * 10) * math.cos(a), v.y, (R + v.x * 10) * math.sin(a))
+end
 local dummy
 dummy = setmetatable({}, { __index = function() return dummy end, __call = function() return dummy end, __add = function() return dummy end })
 local function noop() end
@@ -49,7 +64,6 @@ local function newEnv(client, cfgOverride)
     onSessionStart = noop,
     onOutgoingChatMessage = function(cb) client.chat = cb end,
     getDriverName = function(i) return 'car' .. i end,
-    trackCoordinateToWorld = function() return dummy end,
     log = function(m) if tostring(m):find('rror') or tostring(m):find('unavailable') then W.errors[#W.errors + 1] = tostring(m) end end,
     onCarCollision = function(_, cb) client.hitcb = cb end,
     OnlineEvent = function(_, cb)
@@ -71,9 +85,25 @@ local function newEnv(client, cfgOverride)
       return send, function() return buf end
     end,
   }
+  local gfx = { loads = {}, lights = {} }
+  client.gfx = gfx
+  local function node()
+    local n = {}
+    function n:setVisible(v) self.visible = v; return self end
+    function n:setPosition(p) self.pos = p; return self end
+    function n:setOrientation(look, up) self.look, self.up = look, up; return self end
+    function n:loadKN5Async(path, cb) gfx.loads[#gfx.loads + 1] = path; if W.modelFails then cb('no such file') else cb(nil, {}) end end
+    return n
+  end
+  env.ac.findNodes = function() return { createBoundingSphereNode = function() gfx.node = node(); return gfx.node end } end
+  env.ac.LightType = { Regular = 1 }
+  env.ac.LightSource = function() local l = { color = { r = 0 } }; gfx.lights[#gfx.lights + 1] = l; return l end
+  env.ac.trackCoordinateToWorld = roadPoint
+  env.render = setmetatable({ calls = {}, BlendMode = { BlendAdd = 4, AlphaBlend = 1 } }, { __index = function(tt, k) return function() tt.calls[k] = (tt.calls[k] or 0) + 1 end end })
   local uiStub = setmetatable({ windowSize = function() return { x = 1920, y = 1080 } end, measureDWriteText = function() return { x = 100, y = 20 } end },
     { __index = function() return noop end })
-  env.ui, env.render, env.vec2, env.vec3, env.rgbm = uiStub, dummy, dummy, dummy, dummy
+  env.ui, env.vec2, env.vec3, env.rgbm = uiStub, dummy, vec3, dummy
+  env.rgb = function(r, g, b) return { r = r, g = g, b = b } end
   return env
 end
 
@@ -465,6 +495,57 @@ local function scenarioLeaderless()
   check(W.t - at < 150, 'the flag turns green by itself after 1.5 laps (' .. string.format('%.0f', W.t - at) .. ' s)')
 end
 
+local function scenarioModel()
+  print('== pace car model with a strobe bar')
+  field(6, 45, 200, nil, 1)
+  run(5)
+  check(#W.clients[2].gfx.loads == 0, 'nothing is loaded while the race is green')
+  W.clients[1].chat('!yellow')
+  run(0.5)
+  local gfx, ov = W.clients[2].gfx, W.clients[2].oval
+  check(#gfx.loads == 1 and gfx.loads[1]:find('aston_vantage2018.kn5', 1, true), 'the Aston Martin model is loaded once, when the first pace car appears')
+  check(gfx.node.visible == true, 'and shown')
+  local left, right, off, both, worst = false, false, false, false, { up = 1, fwd = 1, pos = 0 }
+  for _ = 1, math.floor(3 / DT) do
+    step()
+    local a, b = gfx.lights[1].color.r > 0, gfx.lights[2].color.r > 0
+    left, right, off, both = left or (a and not b), right or (b and not a), off or (not a and not b), both or (a and b)
+    local n, s = gfx.node, ov.pacePos()
+    local want = roadPoint(vec3(0, 0, s))
+    local a2 = 2 * math.pi * s
+    local tangent = vec3(-math.sin(a2), 0, math.cos(a2))
+    worst.pos = math.max(worst.pos, math.abs(n.pos.x - want.x) + math.abs(n.pos.z - want.z))
+    worst.up = math.min(worst.up, n.up.y)
+    worst.fwd = math.min(worst.fwd, dot(n.look, tangent))
+  end
+  check(worst.pos < 1e-6, 'the model stands on the synced pace car position')
+  check(worst.up > 0.999 and worst.fwd > 0.999, 'it points along the road and stands upright (up ' .. string.format('%.4f', worst.up) .. ', forward ' .. string.format('%.4f', worst.fwd) .. ')')
+  check(left and right and off and not both, 'the two lights flash in turns and are dark in between, never both at once')
+  check((W.clients[2].env.render.calls.rectangle or 0) > 10, 'the strobe glow is drawn')
+  check(W.clients[2].env.render.calls.setBlendMode % 2 == 0, 'the blend mode is always put back')
+  check(#gfx.loads == 1, 'the model was not loaded again')
+  W.clients[1].chat('!green')
+  run(1)
+  check(gfx.node.visible == false and gfx.lights[1].color.r == 0 and gfx.lights[2].color.r == 0, 'model hidden and lights off on green')
+
+  print('== the model cannot be loaded')
+  field(6, 45, 200, nil, 1)
+  W.modelFails = true
+  run(5)
+  W.clients[1].chat('!yellow')
+  run(3)
+  local c = W.clients[2]
+  check(#c.gfx.loads == 1 and (c.env.render.calls.debugArrow or 0) > 10, 'one attempt, then the arrow marker')
+  W.modelFails = false
+
+  print('== the model is switched off')
+  field(6, 45, 200, { paceModel = '' }, 1)
+  run(5)
+  W.clients[1].chat('!yellow')
+  run(3)
+  check(#W.clients[2].gfx.loads == 0 and (W.clients[2].env.render.calls.debugArrow or 0) > 10, 'paceModel = empty: no model, arrow only')
+end
+
 local function scenarioNoScript()
   print('== the lowest session id has no script')
   local byId = field(8, 45, 200, nil, nil, { [1] = true })
@@ -485,6 +566,7 @@ end
 
 scenarioManual()
 scenarioWreck()
+scenarioModel()
 scenarioGrid()
 scenarioRolling(true)
 scenarioRolling(false)

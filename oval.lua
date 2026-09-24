@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 8.3'
+local VERSION = 'Oval 8.4'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -24,6 +24,8 @@ local cfg = ac.configValues({
   cautionLaps = 1,     -- pace laps before the field may be sent back to green
   maxCautionLaps = 4,  -- restart anyway after this many pace laps
   oneToGoAt = 0.75,    -- the pace car leaves in the last quarter of a lap (track position 0..1), green at the line
+  paceModel = 'content/cars/aston_vantage2018/aston_vantage2018.kn5', -- 3D model of the pace car, '' for the arrow marker only
+  paceFlip = 0,        -- 1: turn the model around if it drives backwards
   everySession = 0,    -- 1: run in every session, not only in races (testing)
   debug = 0,           -- 1: show the debug panel (chat command !ovaldebug toggles it for you)
 })
@@ -329,6 +331,93 @@ local function startRace(cars, rank, now) -- lights out: the field follows the p
   end
 end
 
+-- ── the pace car on the road ─────────────────────────────────────────────────
+-- A car model from the game folder is put on the track every frame at the synced position and
+-- wears a strobe bar. Anything that fails (model missing, API differences) leaves the arrow.
+local car3d = { state = 'idle' } -- idle / loading / ready / failed
+local YELLOW = rgbm(1, 0.82, 0, 0.95)
+local AMBER, WHITE = rgbm(1, 0.55, 0, 14), rgbm(1, 1, 1, 14)
+
+local function loadPaceCar()
+  car3d.state = 'loading'
+  local root = ac.findNodes('carsRoot:yes'):createBoundingSphereNode('OvalPaceCar', 8)
+  if not root then car3d.state = 'failed' return end
+  root:setVisible(false)
+  root:loadKN5Async(cfg.paceModel, function(err, model)
+    if not model then
+      car3d.state = 'failed'
+      ac.log('Oval: pace car model failed: ' .. tostring(err))
+      return
+    end
+    car3d.root, car3d.state = root, 'ready'
+    car3d.lights = {}
+    for i = 1, 2 do
+      local l = ac.LightSource(ac.LightType.Regular)
+      l.range, l.color = 14, rgb(0, 0, 0)
+      car3d.lights[i] = l
+    end
+    ac.log('Oval: pace car model loaded: ' .. cfg.paceModel)
+  end)
+end
+
+-- position on the road, the direction of travel, the way up (follows banking) and to the right
+local function roadFrame(s)
+  local len = trackLen()
+  local p = ac.trackCoordinateToWorld(vec3(0, 0, s))
+  local fwd = (ac.trackCoordinateToWorld(vec3(0, 0, frac(s + 4 / len))) - p):normalize()
+  local side = (ac.trackCoordinateToWorld(vec3(1, 0, s)) - ac.trackCoordinateToWorld(vec3(-1, 0, s))):normalize()
+  local up = side:clone():cross(fwd):normalize()
+  if up.y < 0 then up = up * -1 end
+  return p, fwd, up, side
+end
+
+local function updatePaceCar()
+  local show = S.phase == CAUTION and isActive()
+  if show and car3d.state == 'idle' and cfg.paceModel ~= '' then loadPaceCar() end
+  if car3d.state ~= 'ready' then return end
+  if car3d.visible ~= show then car3d.visible = show; car3d.root:setVisible(show) end
+  car3d.on = nil
+  for _, l in ipairs(car3d.lights) do l.color = rgb(0, 0, 0) end
+  if not show then return end
+
+  local p, fwd, up, side = roadFrame(pacePos())
+  car3d.root:setPosition(p):setOrientation(cfg.paceFlip == 1 and fwd * -1 or fwd, up)
+  local step = math.floor(uiTime * 10) % 6 -- double flash, left (amber) and right (white) in turns
+  car3d.on = { left = step == 0 or step == 2, right = step == 3 or step == 5 }
+  car3d.frame = { p = p, fwd = fwd, up = up, side = side }
+  local bar = p + up * 1.4
+  if car3d.on.left then car3d.lights[1].position, car3d.lights[1].color = bar - side * 0.4, rgb(9, 3.5, 0) end
+  if car3d.on.right then car3d.lights[2].position, car3d.lights[2].color = bar + side * 0.4, rgb(7, 7, 9) end
+end
+
+local function drawPaceCar()
+  local show = S.phase == CAUTION and isActive()
+  if not show then return end
+  if car3d.state ~= 'ready' then -- no model: an arrow and a label
+    local p = ac.trackCoordinateToWorld(vec3(0, 0, pacePos()))
+    render.debugArrow(p + vec3(0, 14, 0), p + vec3(0, 2, 0), 1.5, YELLOW)
+    render.debugText(p + vec3(0, 16, 0), 'PACE CAR', YELLOW, 2)
+    return
+  end
+  local f = car3d.frame
+  if not f then return end
+  local p, fwd, up, side = f.p, f.fwd, f.up, f.side
+  render.debugText(p + up * 3.6, 'PACE CAR', YELLOW, 1.5)
+  if not car3d.on then return end
+  guard(function() -- the glow of the strobe bar: quads facing back, forward and up, added to the scene
+    render.setBlendMode(render.BlendMode.BlendAdd)
+    for _, sd in ipairs({ -1, 1 }) do
+      if (sd < 0 and car3d.on.left) or (sd > 0 and car3d.on.right) then
+        local c, at = sd < 0 and AMBER or WHITE, p + up * 1.4 - fwd * 0.2 + side * (0.4 * sd)
+        render.rectangle(at, fwd * -1, 0.5, 0.14, c)
+        render.rectangle(at, fwd, 0.5, 0.14, c)
+        render.rectangle(at, up, 0.5, 0.3, c)
+      end
+    end
+    render.setBlendMode(render.BlendMode.AlphaBlend)
+  end)()
+end
+
 function script.update(dt)
   guard(function()
     uiTime = uiTime + dt
@@ -345,11 +434,12 @@ function script.update(dt)
     if S.phase == GREEN then startRace(cars, rank, now); watchSelf(dt, now) end
     control(cars, dt, rank)
     localCheck(cars)
+    updatePaceCar()
   end)()
 end
 
 -- ── HUD ──────────────────────────────────────────────────────────────────────
-local YELLOW, GREENC, RED, BLACK = rgbm(1, 0.82, 0, 0.95), rgbm(0.1, 0.75, 0.2, 0.95), rgbm(0.9, 0.1, 0.1, 0.95), rgbm(0, 0, 0, 1)
+local GREENC, RED, BLACK = rgbm(0.1, 0.75, 0.2, 0.95), rgbm(0.9, 0.1, 0.1, 0.95), rgbm(0, 0, 0, 1)
 
 local function centered(text, size, cx, y, color)
   ui.dwriteDrawText(text, size, vec2(cx - ui.measureDWriteText(text, size).x / 2, y), color)
@@ -404,12 +494,7 @@ function script.drawUI()
 end
 
 function script.draw3D()
-  guard(function()
-    if S.phase ~= CAUTION or not isActive() then return end
-    local p = ac.trackCoordinateToWorld(vec3(0, 0, pacePos()))
-    render.debugArrow(p + vec3(0, 14, 0), p + vec3(0, 2, 0), 1.5, YELLOW)
-    render.debugText(p + vec3(0, 16, 0), 'PACE CAR', YELLOW, 2)
-  end)()
+  guard(drawPaceCar)()
 end
 
 pcall(function() ac.log(string.format('Oval: %s loaded, me=%d cars=%d raceType=%s clock=%s', VERSION, ac.getCar(0).sessionID, sim.carsCount, tostring(sim.raceSessionType), tostring(clock()))) end)
