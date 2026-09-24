@@ -121,7 +121,7 @@ local function newEnv(client, cfgOverride)
     if W.penaltyFails then error('physics not available') end
     local name = kind == 1 and 'MandatoryPits' or kind == 3 and 'SlowDown' or kind == 5 and 'ReleaseBlackFlag' or tostring(kind)
     client.penalties[#client.penalties + 1] = { kind = name, param = param, t = W.t }
-    sim.currentPenaltyType, sim.currentPenaltyParameter = kind, param -- what the game reports back
+    car.currentPenaltyType, car.currentPenaltyParameter = kind, param -- what the game reports back (fields of the car)
   end, raycastTrack = function(pos, _, _, hit, normal) -- the asphalt lies 1 m below the height of the spline
     if W.ray == 'error' then error('physics not available') end
     if W.ray == 'miss' then return -1 end
@@ -762,10 +762,13 @@ local function scenarioPenalties()
   W.logs = {}
   run(4)
   local cl, other = W.clients[5], W.clients[6]
-  local seen = false
-  for _, m in ipairs(W.logs) do seen = seen or m:find('game penalty 1/3 lap', 1, true) ~= nil end
-  check(cl.oval.pen().driving == true and seen, 'what the game says about the drive-through is in the log')
-  cl.sim.currentPenaltyType, other.sim.currentPenaltyType = 4, 4 -- the game loses patience with both
+  local seen, where = false, false
+  for _, m in ipairs(W.logs) do
+    seen = seen or m:find('game penalty 1/3 lap', 1, true) ~= nil
+    where = where or m:find('handed out after the green flag (lap ', 1, true) ~= nil
+  end
+  check(cl.oval.pen().driving == true and seen and where, 'what the game says about the drive-through, and where it was handed out, is in the log')
+  cl.car.currentPenaltyType, other.car.currentPenaltyType = 4, 4 -- the game loses patience with both
   run(3)
   check(kinds(cl):sub(-16) == 'ReleaseBlackFlag' and cl.oval.pen().driving == false and noteOf(cl) == 'BLACK FLAG RELEASED', 'the driver of the drive-through is set free again')
   local releases = 0

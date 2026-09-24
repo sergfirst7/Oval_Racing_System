@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 9.2'
+local VERSION = 'Oval 9.3'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -230,7 +230,8 @@ local function handOutOwed()
   local title = 'DRIVE-THROUGH PENALTY' .. (applied and '' or ' (NOT ENFORCED)')
   penNote = { title = title, why = 'Enter the pit lane now', untilT = uiTime + 7 }
   pcall(ac.setMessage, title, 'Enter the pit lane now', 'illegal', 7)
-  ac.log('Oval: ' .. title .. ' handed out after the green flag')
+  local me = ac.getCar(0)
+  ac.log(string.format('Oval: %s handed out after the green flag (lap %s, track position %.3f)', title, tostring(me.lapCount), me.splinePosition))
 end
 
 -- a drive-through is served once the car has been through the pit lane
@@ -245,7 +246,7 @@ end
 -- drive-through we handed out is set free: the driver must not end up parked in the pits for good.
 local gamePen = ''
 local function watchGamePenalty(me)
-  local good, kind, param = pcall(function() return sim.currentPenaltyType, sim.currentPenaltyParameter end)
+  local good, kind, param = pcall(function() return me.currentPenaltyType, me.currentPenaltyParameter end) -- fields of the car, not of ac.getSim()
   if not good then return end
   local key = string.format('%s/%s lap %s pit %s', tostring(kind), tostring(param), tostring(me.lapCount), tostring(me.isInPitlane))
   if key ~= gamePen then gamePen = key; ac.log('Oval: game penalty ' .. key) end
