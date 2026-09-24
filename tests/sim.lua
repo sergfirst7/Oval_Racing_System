@@ -117,9 +117,13 @@ local function newEnv(client, cfgOverride)
   env.ac.LightType = { Regular = 1 }
   env.ac.LightSource = function() local l = { color = { r = 0 } }; gfx.lights[#gfx.lights + 1] = l; return l end
   env.ac.trackCoordinateToWorld = roadPoint
-  env.physics = { setCarPenalty = function(kind, param)
+  env.physics = { forceUserThrottleFor = function(time, level) -- the script's own gas cut
+    if W.penaltyFails then error('physics not available') end
+    client.penalties[#client.penalties + 1] = { kind = 'GasCut', param = time, level = level, t = W.t }
+  end, setCarPenalty = function(kind, param)
     if W.penaltyFails then error('physics not available') end
     local name = kind == 1 and 'MandatoryPits' or kind == 3 and 'SlowDown' or kind == 5 and 'ReleaseBlackFlag' or tostring(kind)
+    if kind == 3 then error('the game SlowDown penalty must not be used any more') end
     client.penalties[#client.penalties + 1] = { kind = name, param = param, t = W.t }
     car.currentPenaltyType, car.currentPenaltyParameter = kind, param -- what the game reports back (fields of the car)
   end, raycastTrack = function(pos, _, _, hit, normal) -- the asphalt lies 1 m below the height of the spline
@@ -735,7 +739,7 @@ local function scenarioPenalties()
   local y = W.t
   run(45)
   local me = W.clients[5]
-  check(kinds(me):sub(1, 8) == 'SlowDown' and me.penalties[1].t - y > 14 and me.penalties[1].param == 5, 'first a warning (no game penalty), then a gas cut of 5 s (' .. kinds(me) .. ')')
+  check(kinds(me):sub(1, 6) == 'GasCut' and me.penalties[1].t - y > 14 and me.penalties[1].param == 5 and me.penalties[1].level == 0, 'first a warning, then a gas cut: the throttle forced to 0 for 5 s (' .. kinds(me) .. ')')
   check(not kinds(me):find('MandatoryPits', 1, true) and me.oval.pen().owed == true, 'the third violation does not hand out a drive-through now (the caution is over before it can be served): it is put on the account')
   local shown = false
   for _, tx in ipairs(me.texts) do shown = shown or tx:find('DRIVE-THROUGH DUE AFTER THE GREEN FLAG', 1, true) ~= nil end
@@ -779,7 +783,7 @@ local function scenarioPenalties()
   speeder({ penalty = 'slow', slowSec = 30 })
   run(45)
   local cuts = 0
-  for _, p in ipairs(W.clients[5].penalties) do if p.kind == 'SlowDown' then cuts = cuts + 1 end end
+  for _, p in ipairs(W.clients[5].penalties) do if p.kind == 'GasCut' then cuts = cuts + 1 end end
   check(cuts == 1 and noteOf(W.clients[5]):find('ALREADY ACTIVE', 1, true), 'a gas cut that is still running is not extended by the next violation (' .. cuts .. ' cut, note: ' .. noteOf(W.clients[5]) .. ')')
 
   print('== penalty = off: warnings only')
@@ -790,7 +794,7 @@ local function scenarioPenalties()
   print('== the default: never more than a gas cut')
   speeder()
   run(45)
-  check(kinds(W.clients[5]):find('SlowDown', 1, true) and not kinds(W.clients[5]):find('MandatoryPits', 1, true), 'only gas cuts (' .. kinds(W.clients[5]) .. ')')
+  check(kinds(W.clients[5]):find('GasCut', 1, true) and not kinds(W.clients[5]):find('MandatoryPits', 1, true), 'only gas cuts (' .. kinds(W.clients[5]) .. ')')
 
   print('== passing the pace car counts double')
   local b2 = field(8, 45, 200, { paceLeadM = 20 }, 1)
@@ -798,7 +802,7 @@ local function scenarioPenalties()
   W.clients[1].chat('!yellow')
   b2[1].hold = 106 -- the leader keeps just under the limit and creeps past the pace car
   run(30)
-  check(kinds(W.clients[1]):sub(1, 8) == 'SlowDown' and W.clients[1].messages[1]:find('Passed the pace car', 1, true), 'a gas cut at the very first violation: ' .. (W.clients[1].messages[1] or '-'))
+  check(kinds(W.clients[1]):sub(1, 6) == 'GasCut' and W.clients[1].messages[1]:find('Passed the pace car', 1, true), 'a gas cut at the very first violation: ' .. (W.clients[1].messages[1] or '-'))
 
   print('== being pushed is no fault')
   speeder()

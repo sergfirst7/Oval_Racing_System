@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 9.3'
+local VERSION = 'Oval 9.4'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -25,7 +25,7 @@ local cfgDefaults = {
   passSec = 1.2,       -- being ahead of the car in front for this long is a violation
   strikeGapSec = 8,    -- the same violation is counted at most once per this many seconds
   slowSec = 5,         -- length of the gas cut penalty
-  driveLaps = 3,       -- laps for a drive-through ('drive' only). In the tests the game sent the car to the pits at the first line crossing even so
+  driveLaps = 3,       -- laps the game gets to serve a drive-through ('drive' only)
   rolling = 1,         -- 1: the race starts behind the pace car (rolling start); 0: standing start
   formationLaps = 1,   -- pace laps of the rolling start before the field may go green
   startLeadM = 40,     -- how far ahead of pole position the pace car starts
@@ -179,21 +179,29 @@ local function setPenalty(kind, param)
   return good
 end
 
+-- The gas cut is done by the script itself, not with the game's SlowDown penalty: that one adds
+-- penalty time (log: `Adding penalty PT`) which was never served, and at the next lap completed
+-- the car got the black flag and ended up in the pits.
+local function cutGas(seconds)
+  local good, err = pcall(function() physics.forceUserThrottleFor(seconds, 0) end)
+  if not good then ac.log('Oval: gas cut could not be applied: ' .. tostring(err)) end
+  return good
+end
+
 local function penalize(why, weight)
   if uiTime - (pen.last[why] or -100) < cfg.strikeGapSec then return end -- the same offence at most once per gap
   pen.last[why], pen.strikes = uiTime, pen.strikes + weight
   local level, title, applied = pen.strikes, 'WARNING', true
   if cfg.penalty ~= 'off' and level >= 2 then
     if cfg.penalty == 'drive' and level >= 3 and not pen.owed and not pen.driving then
-      -- Handed out only when the race is green again: given under caution, the game sent the car
-      -- to the pits (black flag) at the next line crossing. It did so with green-flag hand-outs too
-      -- (see watchGamePenalty), which is why 'drive' is not the default.
+      -- Handed out only when the race is green again: a caution is over in about a lap, too soon
+      -- to serve it. Still unproven in the game (see watchGamePenalty), which is why 'drive' is opt-in.
       title, pen.owed = 'DRIVE-THROUGH AFTER THE GREEN', true
     elseif uiTime - (pen.slowAt or -100) < cfg.slowSec + 3 then
       title = 'GAS CUT (ALREADY ACTIVE)' -- a running gas cut is not extended
     else
       title = 'GAS CUT ' .. cfg.slowSec .. ' S'
-      applied = setPenalty('SlowDown', cfg.slowSec)
+      applied = cutGas(cfg.slowSec)
       if applied then pen.slowAt = uiTime end
     end
   end
