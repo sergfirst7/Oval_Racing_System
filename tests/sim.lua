@@ -10,7 +10,7 @@ local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
 local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {} } -- t in seconds
-local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0, false end
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0, false, 'ok' end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
 local V = {}
@@ -85,20 +85,38 @@ local function newEnv(client, cfgOverride)
       return send, function() return buf end
     end,
   }
-  local gfx = { loads = {}, lights = {} }
+  local gfx = { loads = {}, lights = {}, meshes = {} }
   client.gfx = gfx
   local function node()
     local n = {}
     function n:setVisible(v) self.visible = v; return self end
     function n:setPosition(p) self.pos = p; return self end
     function n:setOrientation(look, up) self.look, self.up = look, up; return self end
-    function n:loadKN5Async(path, cb) gfx.loads[#gfx.loads + 1] = path; if W.modelFails then cb('no such file') else cb(nil, {}) end end
+    function n:loadKN5Async(path, cb) gfx.loads[#gfx.loads + 1] = path; if W.modelFails then cb('no such file') else
+      cb(nil, { findMeshes = function(_, name)
+        local m = gfx.meshes[name]
+        if not m then
+          m = { name = name, emissive = { r = 0 } }
+          function m:ensureUniqueMaterials() self.unique = true; return self end
+          function m:setMaterialProperty(prop, v) self.prop, self.emissive = prop, v; return self end
+          gfx.meshes[name] = m
+        end
+        return m
+      end })
+    end end
     return n
   end
   env.ac.findNodes = function() return { createBoundingSphereNode = function() gfx.node = node(); return gfx.node end } end
   env.ac.LightType = { Regular = 1 }
   env.ac.LightSource = function() local l = { color = { r = 0 } }; gfx.lights[#gfx.lights + 1] = l; return l end
   env.ac.trackCoordinateToWorld = roadPoint
+  env.physics = { raycastTrack = function(pos, _, _, hit, normal) -- the asphalt lies 1 m below the height of the spline
+    if W.ray == 'error' then error('physics not available') end
+    if W.ray == 'miss' then return -1 end
+    hit.x, hit.y, hit.z = pos.x, -1, pos.z
+    normal.x, normal.y, normal.z = 0, 1, 0
+    return pos.y + 1
+  end }
   env.render = setmetatable({ calls = {}, BlendMode = { BlendAdd = 4, AlphaBlend = 1 } }, { __index = function(tt, k) return function() tt.calls[k] = (tt.calls[k] or 0) + 1 end end })
   local uiStub = setmetatable({ windowSize = function() return { x = 1920, y = 1080 } end, measureDWriteText = function() return { x = 100, y = 20 } end },
     { __index = function() return noop end })
@@ -535,7 +553,7 @@ local function scenarioLeaderless()
 end
 
 local function scenarioModel()
-  print('== pace car model with a strobe bar')
+  print('== pace car model: its own light bar flashes, it stands on the asphalt')
   field(6, 45, 200, nil, 1)
   run(5)
   check(#W.clients[2].gfx.loads == 0, 'nothing is loaded while the race is green')
@@ -544,28 +562,45 @@ local function scenarioModel()
   local gfx, ov = W.clients[2].gfx, W.clients[2].oval
   check(#gfx.loads == 1 and gfx.loads[1]:find('aston_vantage2018.kn5', 1, true), 'the Aston Martin model is loaded once, when the first pace car appears')
   check(gfx.node.visible == true, 'and shown')
-  local left, right, off, both, worst = false, false, false, false, { up = 1, fwd = 1, pos = 0 }
+  local A, B = gfx.meshes['g_safety_red'], gfx.meshes['g_safety_yellow']
+  check(A and B and A.unique and B.unique and A ~= B, 'the two lenses of the model own light bar are found and get materials of their own')
+  local seenA, seenB, dark, both, worst = false, false, false, false, { up = 1, fwd = 1, pos = 0, y = 0 }
+  local lightsFollow = true
   for _ = 1, math.floor(3 / DT) do
     step()
-    local a, b = gfx.lights[1].color.r > 0, gfx.lights[2].color.r > 0
-    left, right, off, both = left or (a and not b), right or (b and not a), off or (not a and not b), both or (a and b)
+    local a1, b1 = A.emissive.r > 1, B.emissive.r > 1
+    seenA, seenB, dark, both = seenA or (a1 and not b1), seenB or (b1 and not a1), dark or (not a1 and not b1), both or (a1 and b1)
+    lightsFollow = lightsFollow and ((gfx.lights[1].color.r > 0) == a1) and ((gfx.lights[2].color.r > 0) == b1)
     local n, s = gfx.node, ov.pacePos()
     local want = roadPoint(vec3(0, 0, s))
     local a2 = 2 * math.pi * s
     local tangent = vec3(-math.sin(a2), 0, math.cos(a2))
     worst.pos = math.max(worst.pos, math.abs(n.pos.x - want.x) + math.abs(n.pos.z - want.z))
+    worst.y = math.max(worst.y, math.abs(n.pos.y - (-1)))
     worst.up = math.min(worst.up, n.up.y)
     worst.fwd = math.min(worst.fwd, dot(n.look, tangent))
   end
   check(worst.pos < 1e-6, 'the model stands on the synced pace car position')
+  check(worst.y < 1e-9, 'and on the asphalt found by the ray, not at the spline height (1 m above it here)')
   check(worst.up > 0.999 and worst.fwd > 0.999, 'it points along the road and stands upright (up ' .. string.format('%.4f', worst.up) .. ', forward ' .. string.format('%.4f', worst.fwd) .. ')')
-  check(left and right and off and not both, 'the two lights flash in turns and are dark in between, never both at once')
-  check((W.clients[2].env.render.calls.rectangle or 0) > 10, 'the strobe glow is drawn')
-  check(W.clients[2].env.render.calls.setBlendMode % 2 == 0, 'the blend mode is always put back')
+  check(seenA and seenB and dark and not both, 'the two lenses flash in turns and are dark in between, never both at once')
+  check(lightsFollow, 'the light sources glow exactly when their lens does')
+  check((W.clients[2].env.render.calls.rectangle or 0) == 0, 'no glow squares are drawn any more')
   check(#gfx.loads == 1, 'the model was not loaded again')
   W.clients[1].chat('!green')
   run(1)
-  check(gfx.node.visible == false and gfx.lights[1].color.r == 0 and gfx.lights[2].color.r == 0, 'model hidden and lights off on green')
+  check(gfx.node.visible == false and A.emissive.r == 0 and B.emissive.r == 0 and gfx.lights[1].color.r == 0 and gfx.lights[2].color.r == 0, 'model hidden, lenses and lights dark on green')
+
+  for _, mode in ipairs({ 'miss', 'error' }) do
+    print('== the ground ray ' .. (mode == 'miss' and 'hits nothing' or 'is not available'))
+    field(6, 45, 200, nil, 1)
+    W.ray = mode
+    run(5)
+    W.clients[1].chat('!yellow')
+    run(2)
+    check(math.abs(W.clients[2].gfx.node.pos.y) < 1e-9, 'the model falls back to the spline height')
+  end
+  W.ray = 'ok'
 
   print('== the model cannot be loaded')
   field(6, 45, 200, nil, 1)

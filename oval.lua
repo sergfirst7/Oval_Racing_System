@@ -27,6 +27,8 @@ local cfg = ac.configValues({
   oneToGoAt = 0.75,    -- the pace car leaves in the last quarter of a lap (track position 0..1), green at the line
   paceModel = 'content/cars/aston_vantage2018/aston_vantage2018.kn5', -- 3D model of the pace car, '' for the arrow marker only
   paceFlip = 0,        -- 1: turn the model around if it drives backwards
+  paceLightA = 'g_safety_red',    -- meshes of the model's own light bar that flash (the first one, then...
+  paceLightB = 'g_safety_yellow', -- ...the second one)
   everySession = 0,    -- 1: run in every session, not only in races (testing)
   debug = 0,           -- 1: show the debug panel (chat command !ovaldebug toggles it for you)
 })
@@ -361,11 +363,13 @@ local function startRace(cars, rank, now) -- lights out: the field follows the p
 end
 
 -- ── the pace car on the road ─────────────────────────────────────────────────
--- A car model from the game folder is put on the track every frame at the synced position and
--- wears a strobe bar. Anything that fails (model missing, API differences) leaves the arrow.
+-- A car model from the game folder is put on the track every frame at the synced position. The
+-- model has its own light bar (safety car): its lenses flash by their own emissive, and two light
+-- sources light up the surroundings. Anything that fails leaves the arrow.
 local car3d = { state = 'idle' } -- idle / loading / ready / failed
 local YELLOW = rgbm(1, 0.82, 0, 0.95)
-local AMBER, WHITE = rgbm(1, 0.55, 0, 14), rgbm(1, 1, 1, 14)
+local RED_ON, AMBER_ON, DARK = rgb(14, 0.6, 0), rgb(14, 7, 0), rgb(0, 0, 0)
+local BAR = { 0, 1.45, -1.08 } -- centre of the light bar in the model (right, up, forward), read from the model file
 
 local function loadPaceCar()
   car3d.state = 'loading'
@@ -373,19 +377,24 @@ local function loadPaceCar()
   if not root then car3d.state = 'failed' return end
   root:setVisible(false)
   root:loadKN5Async(cfg.paceModel, function(err, model)
-    if not model then
-      car3d.state = 'failed'
-      ac.log('Oval: pace car model failed: ' .. tostring(err))
-      return
-    end
-    car3d.root, car3d.state = root, 'ready'
-    car3d.lights = {}
-    for i = 1, 2 do
-      local l = ac.LightSource(ac.LightType.Regular)
-      l.range, l.color = 14, rgb(0, 0, 0)
-      car3d.lights[i] = l
-    end
-    ac.log('Oval: pace car model loaded: ' .. cfg.paceModel)
+    guard(function()
+      if not model then
+        car3d.state = 'failed'
+        ac.log('Oval: pace car model failed: ' .. tostring(err))
+        return
+      end
+      -- each lens gets its own material, the two of them share one in the model
+      car3d.lensA = model:findMeshes(cfg.paceLightA):ensureUniqueMaterials()
+      car3d.lensB = model:findMeshes(cfg.paceLightB):ensureUniqueMaterials()
+      car3d.lights = {}
+      for i = 1, 2 do
+        local l = ac.LightSource(ac.LightType.Regular)
+        l.range, l.color = 14, DARK
+        car3d.lights[i] = l
+      end
+      car3d.root, car3d.state = root, 'ready'
+      ac.log('Oval: pace car model loaded: ' .. cfg.paceModel)
+    end)()
   end)
 end
 
@@ -400,28 +409,53 @@ local function roadFrame(s)
   return p, fwd, up, side
 end
 
+-- The height along the spline is not always the height of the asphalt (banking!): ask the physics
+-- of the track for the real surface under that point, the spline is the fallback.
+local function groundedFrame(s)
+  local p, fwd, up, side = roadFrame(s)
+  local hit, normal = vec3(0, 0, 0), vec3(0, 0, 0)
+  local ok, dist = pcall(function() return physics.raycastTrack(p + vec3(0, 4, 0), vec3(0, -1, 0), 12, hit, normal) end)
+  if ok and dist and dist > 0 then
+    p = hit
+    if normal.y > 0.5 then up = normal:clone():normalize() end
+  elseif not car3d.rayLogged then
+    car3d.rayLogged = true
+    ac.log('Oval: no ground ray (' .. tostring(dist) .. '), the pace car follows the spline height')
+  end
+  return p, fwd, up, side
+end
+
+local function setLens(lens, key, on, color)
+  if car3d[key] == on then return end
+  car3d[key] = on
+  lens:setMaterialProperty('ksEmissive', on and color or DARK)
+end
+
 local function updatePaceCar()
   local show = S.phase == CAUTION and isActive()
   if show and car3d.state == 'idle' and cfg.paceModel ~= '' then loadPaceCar() end
   if car3d.state ~= 'ready' then return end
   if car3d.visible ~= show then car3d.visible = show; car3d.root:setVisible(show) end
-  car3d.on = nil
-  for _, l in ipairs(car3d.lights) do l.color = rgb(0, 0, 0) end
-  if not show then return end
 
-  local p, fwd, up, side = roadFrame(pacePos())
-  car3d.root:setPosition(p):setOrientation(cfg.paceFlip == 1 and fwd * -1 or fwd, up)
-  local step = math.floor(uiTime * 10) % 6 -- double flash, left (amber) and right (white) in turns
-  car3d.on = { left = step == 0 or step == 2, right = step == 3 or step == 5 }
-  car3d.frame = { p = p, fwd = fwd, up = up, side = side }
-  local bar = p + up * 1.4
-  if car3d.on.left then car3d.lights[1].position, car3d.lights[1].color = bar - side * 0.4, rgb(9, 3.5, 0) end
-  if car3d.on.right then car3d.lights[2].position, car3d.lights[2].color = bar + side * 0.4, rgb(7, 7, 9) end
+  local onA, onB = false, false
+  if show then
+    local p, fwd, up, side = groundedFrame(pacePos())
+    local mf = cfg.paceFlip == 1 and -1 or 1 -- the model's forward relative to the travel direction
+    car3d.root:setPosition(p):setOrientation(fwd * mf, up)
+    car3d.frame = { p = p, up = up }
+    local step = math.floor(uiTime * 10) % 6 -- double flash: the first lens, then the second, dark in between
+    onA, onB = step == 0 or step == 2, step == 3 or step == 5
+    local bar = p + side * BAR[1] + up * BAR[2] + fwd * (BAR[3] * mf)
+    car3d.lights[1].position, car3d.lights[2].position = bar, bar
+  end
+  setLens(car3d.lensA, 'onA', onA, RED_ON)
+  setLens(car3d.lensB, 'onB', onB, AMBER_ON)
+  car3d.lights[1].color = onA and rgb(9, 0.4, 0) or DARK
+  car3d.lights[2].color = onB and rgb(9, 4.5, 0) or DARK
 end
 
 local function drawPaceCar()
-  local show = S.phase == CAUTION and isActive()
-  if not show then return end
+  if S.phase ~= CAUTION or not isActive() then return end
   if car3d.state ~= 'ready' then -- no model: an arrow and a label
     local p = ac.trackCoordinateToWorld(vec3(0, 0, pacePos()))
     render.debugArrow(p + vec3(0, 14, 0), p + vec3(0, 2, 0), 1.5, YELLOW)
@@ -429,22 +463,7 @@ local function drawPaceCar()
     return
   end
   local f = car3d.frame
-  if not f then return end
-  local p, fwd, up, side = f.p, f.fwd, f.up, f.side
-  render.debugText(p + up * 3.6, 'PACE CAR', YELLOW, 1.5)
-  if not car3d.on then return end
-  guard(function() -- the glow of the strobe bar: quads facing back, forward and up, added to the scene
-    render.setBlendMode(render.BlendMode.BlendAdd)
-    for _, sd in ipairs({ -1, 1 }) do
-      if (sd < 0 and car3d.on.left) or (sd > 0 and car3d.on.right) then
-        local c, at = sd < 0 and AMBER or WHITE, p + up * 1.4 - fwd * 0.2 + side * (0.4 * sd)
-        render.rectangle(at, fwd * -1, 0.5, 0.14, c)
-        render.rectangle(at, fwd, 0.5, 0.14, c)
-        render.rectangle(at, up, 0.5, 0.3, c)
-      end
-    end
-    render.setBlendMode(render.BlendMode.AlphaBlend)
-  end)()
+  if f then render.debugText(f.p + f.up * 3.6, 'PACE CAR', YELLOW, 1.5) end
 end
 
 function script.update(dt)
