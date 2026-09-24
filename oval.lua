@@ -12,6 +12,12 @@ local cfg = ac.configValues({
   catchupKmh = 60,     -- extra speed allowed while closing a big gap to the car ahead
   bunchGapM = 30,      -- gap to keep to the car ahead (or to the pace car)
   paceLeadM = 300,     -- how far ahead of the race leader the pace car appears
+  autoCaution = 1,     -- 1: a car stopped on track calls the caution automatically
+  stopSec = 4,         -- how long a car must stand still on track to count as an incident
+  startGraceSec = 20,  -- no automatic caution during the first seconds of the race
+  cooldownSec = 20,    -- no automatic caution right after a green flag
+  cautionLaps = 2,     -- pace laps before the field may be sent back to green
+  maxCautionLaps = 6,  -- restart anyway after this many pace laps
   everySession = 0,    -- 1: run in every session, not only in races (testing)
   debug = 0,           -- 1: show the debug panel
 })
@@ -39,6 +45,10 @@ local function freshState() return { seq = 0, from = NONE, phase = GREEN, reason
 local S = freshState()
 local L1 = {} -- rule state of the local car
 local function resetLocal() L1 = {} end
+local function adopt(new) -- L1 survives order updates of the same deployment
+  if new.phase ~= S.phase or new.tStart ~= S.tStart then resetLocal() end
+  S = new
+end
 
 local sendEvent, accessEvent, outbox
 local function onState(sender, d)
@@ -48,8 +58,7 @@ local function onState(sender, d)
   if d.tStart > clock() + 3000 then return end -- stale message from a previous session
   local order = {}
   for i = 0, math.min(d.n, ORDER_MAX) - 1 do order[#order + 1] = d.order[i] end
-  S = { seq = d.seq, from = from, phase = d.phase, reason = d.reason, cause = d.cause, tStart = d.tStart, s0 = d.s0, kmh = d.kmh, order = order }
-  resetLocal()
+  adopt({ seq = d.seq, from = from, phase = d.phase, reason = d.reason, cause = d.cause, tStart = d.tStart, s0 = d.s0, kmh = d.kmh, order = order })
 end
 
 local ok, s, a = pcall(ac.OnlineEvent, {
@@ -68,8 +77,7 @@ if ok then sendEvent, accessEvent = s, a else ac.log('Oval: online events unavai
 
 -- Makes a new state current here and queues it for everybody else.
 local function commit(phase, reason, cause, tStart, s0, order)
-  S = { seq = S.seq + 1, from = ac.getCar(0).sessionID, phase = phase, reason = reason, cause = cause, tStart = math.floor(tStart), s0 = s0, kmh = cfg.paceKmh, order = order }
-  resetLocal()
+  adopt({ seq = S.seq + 1, from = ac.getCar(0).sessionID, phase = phase, reason = reason, cause = cause, tStart = math.floor(tStart), s0 = s0, kmh = cfg.paceKmh, order = order })
   if not accessEvent then return end
   local p = accessEvent() -- fill every field: the buffer is reused
   p.seq, p.tStart, p.s0, p.kmh, p.phase, p.reason, p.cause, p.n = S.seq, S.tStart, s0, S.kmh, phase, reason, cause, #order
@@ -118,7 +126,11 @@ local function localCheck(cars)
     if c and not c.isInPitlane and c.speedKmh > STOP_KMH then ref, key, refPos = c, c.sessionID, c.splinePosition break end
   end
   if not ref and S.phase == CAUTION then key, refPos = 'pace', pacePos() end
-  if not refPos then L1.rel = nil return end -- leader with the pace car gone
+  if not refPos then -- leader after the pace car has left: hold the pace until the green flag
+    L1.rel, L1.passing, L1.lagging, L1.allowed = nil, false, false, cfg.paceKmh
+    L1.speeding = me.speedKmh > L1.allowed + cfg.speedTolKmh
+    return
+  end
 
   local len, raw = trackLen(), refPos - me.splinePosition
   if L1.key ~= key or not L1.rel then
@@ -136,8 +148,96 @@ local function localCheck(cars)
   L1.lagging = L1.rel > 4 * cfg.bunchGapM and speed < cfg.paceKmh - 20
 end
 
+-- ── controller: runs only on the client with the lowest session ID ────────────
+local uiTime, lastClock, lastError = 0, 0, nil -- uiTime: seconds since the script started
+local stopT, lastLeader, lastOrderCheck, bunchT = {}, nil, 0, 0
+
+local function stoppedOnTrack(c) return not c.isInPitlane and not c.isRetired and c.speedKmh < STOP_KMH end
+local function moving(c) return not c.isInPitlane and not c.isRetired and c.speedKmh > STOP_KMH end
+
+local function watchIncidents(cars, dt)
+  for id, c in pairs(cars) do
+    if stoppedOnTrack(c) then
+      stopT[id] = (stopT[id] or 0) + dt
+      if stopT[id] >= cfg.stopSec then stopT = {}; return deploy(1, id) end
+    else
+      stopT[id] = nil
+    end
+  end
+end
+
+local function hazard(cars)
+  for _, c in pairs(cars) do if stoppedOnTrack(c) then return true end end
+end
+
+-- every moving car within 2 gaps of the one ahead, the leader within 3 gaps of the pace car
+local function bunched(cars)
+  local len, prev, limit = trackLen(), pacePos(), 3 * cfg.bunchGapM
+  for _, id in ipairs(S.order) do
+    local c = cars[id]
+    if c and moving(c) then
+      if frac(prev - c.splinePosition) * len > limit then return false end
+      prev, limit = c.splinePosition, 2 * cfg.bunchGapM
+    end
+  end
+  return true
+end
+
+-- Cars that left for the pits drop out of the order; cars that come back (or join) take the
+-- place where they rejoined the pack, so nobody can gain places by pitting.
+local function refreshOrder(cars)
+  local order, seen, p = {}, {}, pacePos()
+  local function behind(c) return frac(p - c.splinePosition) end
+  for _, id in ipairs(S.order) do
+    local c = cars[id]
+    if c and not c.isInPitlane and not c.isRetired then order[#order + 1] = id; seen[id] = true end
+  end
+  for id, c in pairs(cars) do
+    if not seen[id] and not c.isInPitlane and not c.isRetired then
+      local at = #order + 1
+      for i, other in ipairs(order) do if behind(cars[other]) > behind(c) then at = i break end end
+      table.insert(order, at, id)
+    end
+  end
+  while #order > ORDER_MAX do order[#order] = nil end
+  local same = #order == #S.order
+  for i = 1, same and #order or 0 do if order[i] ~= S.order[i] then same = false break end end
+  if not same then commit(S.phase, S.reason, S.cause, S.tStart, S.s0, order) end
+end
+
+-- true once, when the first moving car of the order crosses the start/finish line
+local function leaderCrossed(cars)
+  for _, id in ipairs(S.order) do
+    local c = cars[id]
+    if c and moving(c) then
+      local crossed = lastLeader and lastLeader.id == id and lastLeader.s > 0.9 and c.splinePosition < 0.1
+      lastLeader = { id = id, s = c.splinePosition }
+      return crossed
+    end
+  end
+  lastLeader = nil
+end
+
+local function control(cars, dt)
+  local now = clock()
+  if S.phase == GREEN then
+    lastLeader, bunchT = nil, 0
+    if cfg.autoCaution == 1 and sim.isSessionStarted and now > cfg.startGraceSec * 1000 and (S.seq == 0 or now - S.tStart > cfg.cooldownSec * 1000) then
+      watchIncidents(cars, dt)
+    else
+      stopT = {}
+    end
+    return
+  end
+  if uiTime - lastOrderCheck > 1 then lastOrderCheck = uiTime; refreshOrder(cars) end
+  local laps = S.kmh / 3.6 * (now - S.tStart) / 1000 / trackLen()
+  if S.phase == CAUTION and laps >= cfg.cautionLaps and bunched(cars) and not hazard(cars) then bunchT = bunchT + dt else bunchT = 0 end
+  if not leaderCrossed(cars) then return end
+  if S.phase == ONE_TO_GO then return release() end
+  if bunchT > 1.5 or laps >= cfg.maxCautionLaps then commit(ONE_TO_GO, S.reason, S.cause, now, pacePos(), S.order) end
+end
+
 -- ── entry points ─────────────────────────────────────────────────────────────
-local uiTime, lastClock, lastError = 0, 0, nil
 local function guard(fn)
   return function(...)
     local good, err = pcall(fn, ...)
@@ -170,8 +270,11 @@ function script.update(dt)
     local cars, me = activeCars(), ac.getCar(0)
     local controller = NONE
     for id in pairs(cars) do if id < controller then controller = id end end
-    if controller == me.sessionID and S.phase ~= GREEN and not cars[S.from] then
-      commit(S.phase, S.reason, S.cause, S.tStart, S.s0, S.order) -- the sender left: re-announce, late joiners need it
+    if controller == me.sessionID then
+      if S.phase ~= GREEN and not cars[S.from] then
+        commit(S.phase, S.reason, S.cause, S.tStart, S.s0, S.order) -- the sender left: re-announce, late joiners need it
+      end
+      control(cars, dt)
     end
     localCheck(cars)
   end)()
@@ -206,12 +309,12 @@ function script.drawUI()
     centered(title, 30 * k, cx, y + 6 * k, BLACK)
     if showGreen then return end
 
-    local follow = L1.ref and ac.getDriverName(L1.ref.index) or 'PACE CAR'
-    centered('FOLLOW  ' .. follow, 18 * k, cx, y + 44 * k, BLACK)
-    if L1.rel then
-      local bad = L1.speeding or L1.passing
-      centered(string.format('%d m     %d / %d km/h', math.floor(math.max(L1.rel, 0) + 0.5), math.floor(ac.getCar(0).speedKmh), math.floor(L1.allowed + 0.5)),
-        22 * k, cx, y + 72 * k, bad and RED or BLACK)
+    local follow = L1.ref and 'FOLLOW  ' .. ac.getDriverName(L1.ref.index) or S.phase == ONE_TO_GO and 'GREEN AT THE LINE - HOLD THE PACE' or 'FOLLOW  PACE CAR'
+    centered(follow, 18 * k, cx, y + 44 * k, BLACK)
+    if L1.allowed then
+      local gap = L1.rel and string.format('%d m     ', math.floor(math.max(L1.rel, 0) + 0.5)) or ''
+      centered(string.format('%s%d / %d km/h', gap, math.floor(ac.getCar(0).speedKmh), math.floor(L1.allowed + 0.5)),
+        22 * k, cx, y + 72 * k, (L1.speeding or L1.passing) and RED or BLACK)
     end
     local warn = L1.passing and 'DO NOT PASS - DROP BACK' or L1.speeding and 'SLOW DOWN' or L1.lagging and 'CLOSE THE GAP'
     if warn then
