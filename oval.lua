@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 8.1'
+local VERSION = 'Oval 8.2'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -18,6 +18,9 @@ local cfg = ac.configValues({
   raceKmh = 80,        -- a car only counts after it has been this fast since the last green
   startGraceSec = 20,  -- no automatic caution during the first seconds of the race
   cooldownSec = 20,    -- no automatic caution right after a green flag
+  rolling = 1,         -- 1: the race starts behind the pace car (rolling start); 0: standing start
+  formationLaps = 1,   -- pace laps of the rolling start before the field may go green
+  startLeadM = 40,     -- how far ahead of pole position the pace car starts
   cautionLaps = 2,     -- pace laps before the field may be sent back to green
   maxCautionLaps = 6,  -- restart anyway after this many pace laps
   everySession = 0,    -- 1: run in every session, not only in races (testing)
@@ -26,7 +29,7 @@ local cfg = ac.configValues({
 
 local GREEN, CAUTION, ONE_TO_GO = 0, 1, 2
 local NONE, ORDER_MAX, STOP_KMH, RANK_DELAY = 255, 48, 25, 0.4
-local TITLES = { [0] = 'CAUTION', [1] = 'CAUTION - CAR STOPPED', [3] = 'CAUTION - WRECK' }
+local TITLES = { [0] = 'CAUTION', [1] = 'CAUTION - CAR STOPPED', [2] = 'ROLLING START', [3] = 'CAUTION - WRECK' }
 
 local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
@@ -96,16 +99,19 @@ local function pacePos() return frac(S.s0 + S.kmh / 3.6 * (clock() - S.tStart) /
 
 local function ahead(a, b) -- is car a ahead of car b in the race
   if a.racePosition > 0 and b.racePosition > 0 and a.racePosition ~= b.racePosition then return a.racePosition < b.racePosition end
+  if S.seq == 0 and a.lapCount == 0 and b.lapCount == 0 then return frac(-a.splinePosition) < frac(-b.splinePosition) end -- on the grid: closest before the line
   return a.lapCount + a.splinePosition > b.lapCount + b.splinePosition
 end
 
+-- reason: 0 admin, 1 stopped car, 2 rolling start, 3 wreck
 local function deploy(reason, cause)
   local cars, head = activeCars(), nil
   for _, c in pairs(cars) do
     if not c.isInPitlane and (not head or ahead(c, head)) then head = c end
   end
   if not head then return end
-  local s0, list = frac(head.splinePosition + cfg.paceLeadM / trackLen()), {}
+  local lead = reason == 2 and cfg.startLeadM or cfg.paceLeadM
+  local s0, list = frac(head.splinePosition + lead / trackLen()), {}
   for _, c in pairs(cars) do
     if not c.isInPitlane and not c.isRetired then list[#list + 1] = c end
   end
@@ -127,10 +133,11 @@ local function localCheck(cars)
   for i, id in ipairs(S.order) do if id == me.sessionID then idx = i break end end
   if not idx then L1 = {} return end
 
+  local launching = S.reason == 2 and clock() - S.tStart < 15000 -- cars still accelerate from the grid
   local ref, key, refPos
   for j = idx - 1, 1, -1 do -- nearest car ahead that is on track and moving
     local c = cars[S.order[j]]
-    if c and not c.isInPitlane and c.speedKmh > STOP_KMH then ref, key, refPos = c, c.sessionID, c.splinePosition break end
+    if c and not c.isInPitlane and (c.speedKmh > STOP_KMH or launching) then ref, key, refPos = c, c.sessionID, c.splinePosition break end
   end
   if not ref and S.phase == CAUTION then key, refPos = 'pace', pacePos() end
   if not refPos then -- leader after the pace car has left: hold the pace until the green flag
@@ -151,7 +158,7 @@ local function localCheck(cars)
   local speed = me.speedKmh
   L1.allowed = cfg.paceKmh + clamp((L1.rel - cfg.bunchGapM) / (4 * cfg.bunchGapM), 0, 1) * cfg.catchupKmh
   L1.speeding = speed > L1.allowed + cfg.speedTolKmh
-  L1.passing = L1.rel < -3
+  L1.passing = L1.rel < (S.reason == 2 and -12 or -3) -- the grid is two abreast, a few metres either way are fine
   L1.lagging = L1.rel > 4 * cfg.bunchGapM and speed < cfg.paceKmh - 20
 end
 
@@ -253,8 +260,9 @@ local function control(cars, dt, rank)
   if order and due('order', rank) then return commit(S.phase, S.reason, S.cause, S.tStart, S.s0, order) end
 
   local laps = S.kmh / 3.6 * (clock() - S.tStart) / 1000 / trackLen()
-  if S.phase == CAUTION and laps >= cfg.cautionLaps and bunched(cars) and not hazard(cars) then bunchT = bunchT + dt else bunchT = 0 end
-  if leaderCrossed(cars) then ctl.cross = { at = uiTime, go = S.phase == ONE_TO_GO or bunchT > 1.5 or laps >= cfg.maxCautionLaps } end
+  local need = S.reason == 2 and cfg.formationLaps or cfg.cautionLaps
+  if S.phase == CAUTION and bunched(cars) and not hazard(cars) then bunchT = bunchT + dt else bunchT = 0 end
+  if leaderCrossed(cars) then ctl.cross = { at = uiTime, go = S.phase == ONE_TO_GO or (laps >= need and bunchT > 1.5) or laps >= cfg.maxCautionLaps } end
   local x = ctl.cross
   if not (x and x.go and uiTime - x.at < 2.5 + rank * RANK_DELAY) then return end
   if S.phase == ONE_TO_GO then
@@ -286,6 +294,14 @@ ac.onOutgoingChatMessage(function(msg)
   return true
 end)
 
+local function startRace(rank, now) -- lights out: the field follows the pace car instead of racing away
+  if cfg.rolling ~= 1 or S.seq > 0 or now < 0 or now > 15000 or not due('start', rank) then return end
+  local list = {}
+  for id, c in pairs(activeCars()) do list[#list + 1] = string.format('%d:p%d:%.4f', id, c.racePosition, c.splinePosition) end
+  ac.log('Oval: rolling start, grid ' .. table.concat(list, ' '))
+  deploy(2, NONE)
+end
+
 function script.update(dt)
   guard(function()
     uiTime = uiTime + dt
@@ -299,7 +315,7 @@ function script.update(dt)
     local rank = 0
     for id in pairs(cars) do if id < me.sessionID then rank = rank + 1 end end
     hudCars, hudRank = cars, rank
-    if S.phase == GREEN then watchSelf(dt, now) end
+    if S.phase == GREEN then startRace(rank, now); watchSelf(dt, now) end
     control(cars, dt, rank)
     localCheck(cars)
   end)()
@@ -336,7 +352,7 @@ function script.drawUI()
     elseif S.phase == CAUTION then
       title, bg = TITLES[S.reason] or 'CAUTION', YELLOW
       local who = hudCars[S.cause]
-      note = who and ac.getDriverName(who.index)
+      note = S.reason == 2 and 'HOLD YOUR POSITION - GREEN AT THE LINE' or who and ac.getDriverName(who.index)
     end
     local h = 44 + (note and 24 or 0) + (showGreen and 0 or 28 + (L1.allowed and 32 or 0))
     ui.drawRectFilled(vec2(cx - 250 * k, y), vec2(cx + 250 * k, y + h * k), bg, 10 * k)

@@ -10,7 +10,7 @@ local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
 local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {} } -- t in seconds
-local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup = 0, {}, {}, {}, 60 end
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults = 0, {}, {}, {}, 60, false, { rolling = 0 } end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
 local dummy
@@ -29,7 +29,12 @@ local function newEnv(client, cfgOverride)
     getSim = function() return sim end,
     configValues = function(layout)
       local c = {}
-      for k, v in pairs(layout) do c[k] = (cfgOverride and cfgOverride[k]) or v end
+      for k, v in pairs(layout) do
+        local o = cfgOverride and cfgOverride[k]
+        if o == nil then o = W.defaults[k] end -- tests start standing unless a scenario asks for a rolling start
+        if o == nil then o = v end
+        c[k] = o
+      end
       return c
     end,
     getCar = function(i)
@@ -105,7 +110,7 @@ local function disconnect(client) client.connected, client.car.isConnected, clie
 
 -- A driver who follows the rules: closes gaps like a human would, never above the limit.
 local function target(car, phase, pace, paceKmh)
-  if car.stopped then return 0 end
+  if car.stopped or (W.hold and W.t < 0) then return 0 end
   if phase == GREEN or car.ignore then return car.cruise end
   if phase == ONE_TO_GO then return paceKmh - 4 end
   local gap, aheadKmh = TRACK, paceKmh
@@ -383,6 +388,42 @@ local function scenarioGrid()
   check(W.clients[1].oval.state().cause == 3, 'but a car that stops after racing does')
 end
 
+local function scenarioRolling()
+  print('== rolling start')
+  resetWorld()
+  W.defaults.rolling, W.hold = 1, true
+  local byId, initial = {}, {}
+  for i = 1, 10 do -- two abreast, rows 20 m apart, the outside car 8 m behind its row mate
+    byId[i] = addCar(i, 0.999 - (math.ceil(i / 2) - 1) * 20 / TRACK - (i % 2 == 0 and 8 or 0) / TRACK, 0, { cruise = 200 })
+    initial[i] = byId[i]
+  end
+  for _, c in ipairs(initial) do addClient(c, false, { formationLaps = 2 }) end
+  W.t = -6
+  run(5)
+  everyone(GREEN, 'the field waits on the grid while the lights count down')
+  local watch = {}
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 5, 'the rolling start')
+  local st = W.clients[1].oval.state()
+  check(st.reason == 2 and st.from == 1 and W.t < 1.5, 'the pace car is released with the lights (t=' .. string.format('%.1f', W.t) .. ')')
+  check(table.concat(st.order, ',') == '1,2,3,4,5,6,7,8,9,10', 'the order is the grid order (' .. table.concat(st.order, ',') .. ')')
+  local started = W.t
+  run(3)
+  local one, two = byId[1], byId[2] -- the outside car of the first row edges 8 m ahead of its row mate while launching
+  two.splinePosition = one.splinePosition + 8 / TRACK
+  run(0.5)
+  check(not W.clients[2].oval.local1().passing, 'a row mate 8 m ahead on the launch is not yet a pass')
+  two.splinePosition = one.splinePosition - 8 / TRACK
+  for _ = 1, math.floor(400 / DT) do
+    step(); watchClean(watch, started + 25)
+    if W.clients[1].oval.state().phase == GREEN and W.t > started + 20 then break end
+  end
+  local g = W.clients[1].oval.state()
+  check(g.phase == GREEN and g.reason == 0 and g.seq > st.seq and W.t - started > 250, 'the flag turns green only after formationLaps pace laps (' .. string.format('%.0f', W.t - started) .. ' s after the start)')
+  check(not watch.dirty, 'nobody who followed the rules was warned' .. (watch.dirty and (': ' .. watch.dirty) or ''))
+  run(40)
+  everyone(GREEN, 'the race goes on green, no automatic caution right after the start')
+end
+
 local function scenarioNoScript()
   print('== the lowest session id has no script')
   local byId = field(8, 45, 200, nil, nil, { [1] = true })
@@ -404,6 +445,7 @@ end
 scenarioManual()
 scenarioWreck()
 scenarioGrid()
+scenarioRolling()
 scenarioNoScript()
 scenarioAuto()
 scenarioGiveUp()
