@@ -752,7 +752,11 @@ local function scenarioPenalties()
   check(me.oval.pen().driving == false, 'a drive-through is served after a run through the pit lane')
 
   print('== a black flag for an unserved drive-through is released')
+  W.logs = {}
   speeder({ penalty = 'drive' })
+  local loaded = false
+  for _, m in ipairs(W.logs) do loaded = loaded or m:find('Oval: session laps=', 1, true) ~= nil end
+  check(loaded, 'the length of the race (laps or minutes) is logged when the script loads')
   run(45)
   W.clients[1].chat('!green')
   W.logs = {}

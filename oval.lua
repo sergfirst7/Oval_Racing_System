@@ -727,6 +727,8 @@ function script.draw3D()
 end
 
 pcall(function() ac.log(string.format('Oval: %s loaded, CSP %s, me=%d cars=%d raceType=%s clock=%s events=%s penalty=%s', VERSION, tostring(build), ac.getCar(0).sessionID, sim.carsCount, tostring(sessionType()), tostring(clock()), tostring(sendEvent ~= nil), cfg.penalty)) end)
+-- a timed race has no lap count, which may be why the game cannot count the laps of a drive-through
+pcall(function() local s = ac.getSession(sim.currentSessionIndex); ac.log(string.format('Oval: session laps=%s timed=%s minutes=%s', tostring(s.laps), tostring(s.isTimedRace), tostring(s.durationMinutes))) end)
 
 -- Offline tests load this file with a fake `ac` and read the internals from here.
 if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, pen = function() return pen end, note = function() return penNote end, stats = function() return stats end } end
