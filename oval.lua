@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 10.0'
+local VERSION = 'Oval 10.1'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -35,6 +35,7 @@ local cfgDefaults = {
   oneToGoAt = 0.75,    -- the pace car leaves in the last quarter of a lap (track position 0..1), green at the line
   paceModel = 'content/cars/aston_vantage2018/aston_vantage2018.kn5', -- 3D model of the pace car, '' for the arrow marker only
   paceFlip = 0,        -- 1: turn the model around if it drives backwards
+  paceWheelSpin = 1,   -- -1: if the wheels of the model turn backwards
   paceLightA = 'g_safety_red',    -- meshes of the model's own light bar that flash (the first one, then...
   paceLightB = 'g_safety_yellow', -- ...the second one)
   everySession = 0,    -- 1: run in every session, not only in races (testing)
@@ -172,6 +173,50 @@ local function greenLine()
   return math.floor(paceRun()), math.max(1, math.ceil(S.s0 + need - 0.5))
 end
 
+-- ── the pit lane ─────────────────────────────────────────────────────────────
+-- The track's own AI line of the pit lane (ai/pit_lane.ai: a header of 4 int32, then per point
+-- x, y, z, distance along the line as floats and an int32 id), read once. The pit lane proper is
+-- the longest stretch where that line runs more than 8 m outside the edge of the road.
+local function i32(s, i) local a, b, c, d = s:byte(i, i + 3); local n = a + b * 256 + c * 65536 + d * 16777216; return n >= 2147483648 and n - 4294967296 or n end
+local function f32(s, i) -- little-endian IEEE 754
+  local a, b, c, d = s:byte(i, i + 3)
+  local exp, mant = (d % 128) * 2 + math.floor(c / 128), ((c % 128) * 256 + b) * 256 + a
+  local x = exp == 0 and mant * 2 ^ -149 or (1 + mant / 8388608) * 2 ^ (exp - 127)
+  return d >= 128 and -x or x
+end
+
+local pit -- nil: not read yet, false: none, else { pts, a, b (pit lane proper), inI (where the pace car turns in), exitS, inS }
+local function loadPit()
+  pit = false
+  local good, data = pcall(function() return io.load((ac.getTrackDataFilename('x'):gsub('data[/\\]x$', 'ai/pit_lane.ai'))) end)
+  if not good or type(data) ~= 'string' or #data < 36 then ac.log('Oval: no pit lane line, the pace car appears on the road (' .. tostring(data) .. ')') return end
+  local n = i32(data, 5)
+  if n < 10 or #data < 16 + n * 20 then ac.log('Oval: pit lane line unreadable, ' .. n .. ' points') return end
+  local pts, a, b, run = {}, nil, nil, nil
+  for i = 1, n + 1 do
+    if i <= n then
+      local o = 17 + (i - 1) * 20
+      local p = vec3(f32(data, o), f32(data, o + 4), f32(data, o + 8))
+      local t = ac.worldCoordinateToTrack(p)
+      local sides = ac.getTrackAISplineSides(t.z)
+      pts[i] = { p = p, d = f32(data, o + 12), s = t.z, off = (math.abs(t.x) - 1) * (sides.x + sides.y) / 2 }
+    end
+    if i <= n and pts[i].off > 8 then run = run or i
+    elseif run then
+      if not a or i - 1 - run > b - a then a, b = run, i - 1 end
+      run = nil
+    end
+  end
+  if not a or pts[b].d - pts[a].d < 100 then ac.log('Oval: the pit lane line never leaves the road, the pace car appears on the road') return end
+  local inI = a -- the pace car turns in 150 m before the pit lane proper, where the line is still on the road
+  while inI > 1 and pts[a].d - pts[inI].d < 150 do inI = inI - 1 end
+  pit = { pts = pts, a = a, b = b, inI = inI, exitS = pts[b].s, inS = pts[inI].s }
+  ac.log(string.format('Oval: pit lane %d m long, in at %.3f, out at %.3f of the lap', math.floor(pts[b].d - pts[a].d), pit.inS, pit.exitS))
+end
+
+-- where the pace car leaves the road for good (one to go): at the pit lane, if it is in the second half of the lap
+local function goAt() return pit and pit.inS > 0.5 and pit.inS < 0.97 and pit.inS or cfg.oneToGoAt end
+
 local function ahead(a, b) -- is car a ahead of car b in the race
   local pa, pb = a.racePosition or 0, b.racePosition or 0
   if pa > 0 and pb > 0 and pa ~= pb then return pa < pb end
@@ -188,6 +233,10 @@ local function deploy(reason, cause)
   if not head then return end
   local lead = reason == 2 and cfg.startLeadM or cfg.paceLeadM
   local s0, list = frac(head.splinePosition + lead / trackLen()), {}
+  -- the pace car joins from the pit lane when it gets to the pit exit: if that is just ahead of the
+  -- leader, it starts right there, not a lap later
+  local toExit = pit and reason ~= 2 and frac(pit.exitS - head.splinePosition) * trackLen()
+  if toExit and toExit > 100 and toExit < lead then s0 = pit.exitS end
   for _, c in pairs(cars) do
     if not c.isInPitlane and not c.isRetired then list[#list + 1] = c end
   end
@@ -524,7 +573,7 @@ local function control(cars, dt, rank)
     -- a fixed length: neither a car standing on track nor a gap in the line makes the caution longer
     local crossed, greenAt = greenLine()
     local pos = pacePos()
-    if crossed >= greenAt - 1 and pos >= cfg.oneToGoAt and due('one', rank) then -- the pace car pulls off before the last turns
+    if crossed >= greenAt - 1 and pos >= goAt() and due('one', rank) then -- the pace car pulls off into the pit lane before the line
       commit(ONE_TO_GO, S.reason, S.cause, clock(), pos, S.order)
     end
     return
@@ -630,37 +679,87 @@ local function loadPaceCar()
         l.range, l.color = 14, DARK
         car3d.lights[i] = l
       end
+      -- wheels (the usual node names of AC cars) turn around their own axle; the blurred rims show at speed
+      car3d.wheels, car3d.rims, car3d.blurs, car3d.spin = {}, {}, {}, 0
+      for _, w in ipairs({ 'LF', 'RF', 'LR', 'RR' }) do
+        local node = model:findNodes('WHEEL_' .. w)
+        local raw = node:size() > 0 and node:getTransformationRaw()
+        if raw then car3d.wheels[#car3d.wheels + 1] = { raw = raw, base = raw:clone(), sign = raw.side.x < 0 and -1 or 1 } end -- right wheels are mirrored
+        car3d.rims[#car3d.rims + 1], car3d.blurs[#car3d.blurs + 1] = model:findAny('RIM_' .. w), model:findAny('RIM_BLUR_' .. w)
+      end
       car3d.root, car3d.state = root, 'ready'
-      ac.log('Oval: pace car model loaded: ' .. cfg.paceModel)
+      ac.log('Oval: pace car model loaded: ' .. cfg.paceModel .. ', wheels ' .. #car3d.wheels)
     end)()
   end)
 end
 
--- position on the road, the direction of travel, the way up (follows banking) and to the right
+-- position on the road and the direction of travel
 local function roadFrame(s)
-  local len = trackLen()
   local p = ac.trackCoordinateToWorld(vec3(0, 0, s))
-  local fwd = (ac.trackCoordinateToWorld(vec3(0, 0, frac(s + 4 / len))) - p):normalize()
-  local side = (ac.trackCoordinateToWorld(vec3(1, 0, s)) - ac.trackCoordinateToWorld(vec3(-1, 0, s))):normalize()
-  local up = side:clone():cross(fwd):normalize()
-  if up.y < 0 then up = up * -1 end
-  return p, fwd, up, side
+  return p, (ac.trackCoordinateToWorld(vec3(0, 0, frac(s + 4 / trackLen()))) - p):normalize()
 end
 
--- The height along the spline is not always the height of the asphalt (banking!): ask the physics
--- of the track for the real surface under that point, the spline is the fallback.
-local function groundedFrame(s)
-  local p, fwd, up, side = roadFrame(s)
-  local hit, normal = vec3(0, 0, 0), vec3(0, 0, 0)
+-- a point of the pit lane line `dist` metres along it, and the direction there
+local function pitPoint(dist)
+  local pts, lo = pit.pts, 1
+  local hi = #pts
+  while hi - lo > 1 do
+    local m = math.floor((lo + hi) / 2)
+    if pts[m].d <= dist then lo = m else hi = m end
+  end
+  local a, b = pts[lo], pts[hi]
+  local k = clamp((dist - a.d) / math.max(b.d - a.d, 0.001), 0, 1)
+  return a.p + (b.p - a.p) * k, (b.p - a.p):normalize()
+end
+
+-- Where the pace car is drawn. The rules only know its synced point on the road; the picture adds
+-- the pit lane. Out: it waits in the middle of the pit lane and drives off so that it reaches the end
+-- of the pit lane at full pace just as its synced point passes there. In (one to go): from the turn-in
+-- point it slows down to a stop in the middle of the pit lane. 2.5 s of lane change join the two lines.
+-- Returns the position, the direction, the speed in m/s and "still in the pits" (nothing: not shown).
+local BLEND = 2.5
+local function paceVisual()
+  local v, len = S.kmh / 3.6, trackLen()
+  local p, fwd = roadFrame(pacePos())
+  if S.phase == CAUTION then
+    if not pit or S.reason == 2 then return p, fwd, v, false end -- the rolling start begins on the grid
+    local pts = pit.pts
+    local out = (pts[pit.b].d - pts[pit.a].d) / 2
+    local left = (S.tStart + frac(pit.exitS - S.s0) * len / v * 1000 - clock()) / 1000 -- seconds to the pit exit
+    if left > 0 then
+      local T = 2 * out / v -- from a stop to the pace over the second half of the pit lane
+      local tau = math.min(left, T)
+      local q, dir = pitPoint(pts[pit.b].d - v * tau + v / T / 2 * tau * tau)
+      return q, dir, v * (1 - tau / T), true
+    end
+    if -left >= BLEND then return p, fwd, v, false end
+    local q, dir = pitPoint(pts[pit.b].d - v * left)
+    local k = -left / BLEND
+    return q + (p - q) * k, (dir + (fwd - dir) * k):normalize(), v, false
+  end
+  if S.phase ~= ONE_TO_GO or not pit or goAt() ~= pit.inS then return end
+  local pts, since = pit.pts, (clock() - S.tStart) / 1000
+  local T = 2 * ((pts[pit.a].d + pts[pit.b].d) / 2 - pts[pit.inI].d) / v
+  if since >= T then return end
+  local late = frac(S.s0 - pit.inS) -- the flag came a little after the turn-in point
+  local q, dir = pitPoint(pts[pit.inI].d + (late < 0.5 and late * len or 0) + v * since - v / T / 2 * since * since)
+  local k = math.min(since / BLEND, 1)
+  return p + (q - p) * k, (fwd + (dir - fwd) * k):normalize(), v * (1 - since / T), k >= 1
+end
+
+-- The height of a line is not always the height of the asphalt (banking!): ask the physics of the
+-- track for the real surface under that point, the line is the fallback.
+local function grounded(p, fwd)
+  local up, hit, normal = vec3(0, 1, 0), vec3(0, 0, 0), vec3(0, 0, 0)
   local ok, dist = pcall(function() return physics.raycastTrack(p + vec3(0, 4, 0), vec3(0, -1, 0), 12, hit, normal) end)
   if ok and dist and dist > 0 then
     p = hit
     if normal.y > 0.5 then up = normal:clone():normalize() end
   elseif not car3d.rayLogged then
     car3d.rayLogged = true
-    ac.log('Oval: no ground ray (' .. tostring(dist) .. '), the pace car follows the spline height')
+    ac.log('Oval: no ground ray (' .. tostring(dist) .. '), the pace car follows the height of the line')
   end
-  return p, fwd, up, side
+  return p, up
 end
 
 local function setLens(lens, key, on, color)
@@ -669,21 +768,33 @@ local function setLens(lens, key, on, color)
   lens:setMaterialProperty('ksEmissive', on and color or DARK)
 end
 
-local function updatePaceCar()
-  local show = S.phase == CAUTION and isActive()
+local WHEEL_R = 0.34 -- metres, a sports car wheel
+local function updatePaceCar(dt)
+  local p, fwd, speed, inPits
+  if isActive() and S.phase ~= GREEN then p, fwd, speed, inPits = paceVisual() end
+  local show = p ~= nil
+  car3d.inPits, car3d.frame = show and inPits, show and { p = p, up = vec3(0, 1, 0) } or nil
   if show and car3d.state == 'idle' and cfg.paceModel ~= '' then loadPaceCar() end
   if car3d.state ~= 'ready' then return end
   if car3d.visible ~= show then car3d.visible = show; car3d.root:setVisible(show) end
 
   local onA, onB = false, false
   if show then
-    local p, fwd, up, side = groundedFrame(pacePos())
+    local up
+    p, up = grounded(p, fwd)
     local mf = cfg.paceFlip == 1 and -1 or 1 -- the model's forward relative to the travel direction
     car3d.root:setPosition(p):setOrientation(fwd * mf, up)
-    car3d.frame = { p = p, up = up }
+    car3d.frame.p, car3d.frame.up = p, up
+    car3d.spin = (car3d.spin + speed * dt / WHEEL_R) % (2 * math.pi)
+    for _, w in ipairs(car3d.wheels) do w.raw:set(mat4x4.rotation(car3d.spin * w.sign * mf * cfg.paceWheelSpin, vec3(1, 0, 0)):mul(w.base)) end
+    local blur = speed > 15
+    if car3d.blur ~= blur then
+      car3d.blur = blur
+      for i = 1, #car3d.rims do car3d.rims[i]:setVisible(not blur); car3d.blurs[i]:setVisible(blur) end
+    end
     local step = math.floor(uiTime * 10) % 6 -- double flash: the first lens, then the second, dark in between
     onA, onB = step == 0 or step == 2, step == 3 or step == 5
-    local bar = p + side * BAR[1] + up * BAR[2] + fwd * (BAR[3] * mf)
+    local bar = p + up * BAR[2] + fwd * (BAR[3] * mf)
     car3d.lights[1].position, car3d.lights[2].position = bar, bar
   end
   setLens(car3d.lensA, 'onA', onA, RED_ON)
@@ -693,15 +804,18 @@ local function updatePaceCar()
 end
 
 local function drawPaceCar()
-  if S.phase ~= CAUTION or not isActive() then return end
-  if car3d.state ~= 'ready' then -- no model: an arrow and a label
-    local p = ac.trackCoordinateToWorld(vec3(0, 0, pacePos()))
-    render.debugArrow(p + vec3(0, 14, 0), p + vec3(0, 2, 0), 1.5, YELLOW)
-    render.debugText(p + vec3(0, 16, 0), 'PACE CAR', YELLOW, 2)
-    return
-  end
   local f = car3d.frame
-  if f then render.debugText(f.p + f.up * 3.6, 'PACE CAR', YELLOW, 1.5) end
+  if f and car3d.state ~= 'ready' then -- no model: an arrow and a label
+    render.debugArrow(f.p + vec3(0, 14, 0), f.p + vec3(0, 2, 0), 1.5, YELLOW)
+    render.debugText(f.p + vec3(0, 16, 0), 'PACE CAR', YELLOW, 2)
+  elseif f then
+    render.debugText(f.p + f.up * 3.6, 'PACE CAR', YELLOW, 1.5)
+  end
+  if car3d.inPits and S.phase == CAUTION then -- the leader follows its point on the road while it is still in the pits
+    local q = ac.trackCoordinateToWorld(vec3(0, 0, pacePos()))
+    render.debugArrow(q + vec3(0, 14, 0), q + vec3(0, 2, 0), 1.5, YELLOW)
+    render.debugText(q + vec3(0, 16, 0), 'PACE CAR LEAVING THE PITS', YELLOW, 2)
+  end
 end
 
 function script.update(dt)
@@ -723,6 +837,7 @@ function script.update(dt)
       end
     end
     if not isActive() then if S.seq > 0 then reset() end return end
+    if pit == nil then loadPit() end
 
     local cars, me = activeCars(), ac.getCar(0)
     local rank = 0
@@ -735,7 +850,7 @@ function script.update(dt)
     servePenalty(me)
     handOutOwed()
     watchGamePenalty(me)
-    updatePaceCar()
+    updatePaceCar(dt)
   end)()
 end
 
@@ -803,6 +918,7 @@ function script.drawUI()
       title, bg = TITLES[S.reason] or 'CAUTION', YELLOW
       local who = hudCars[S.cause]
       lines[1] = S.reason == 2 and 'HOLD YOUR ROW - GREEN AT THE LINE' or who and ac.getDriverName(who.index) or nil
+      if car3d.inPits then lines[#lines + 1] = 'PACE CAR LEAVING THE PITS - HOLD THE PACE' end
     end
     if not showGreen then
       if L1.out then

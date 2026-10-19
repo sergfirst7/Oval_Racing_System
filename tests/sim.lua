@@ -10,7 +10,7 @@ local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
 local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {}, logs = {}, oldApi = {} } -- t in seconds
-local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray, W.penaltyFails = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0, false, 'ok', false end
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray, W.penaltyFails, W.pitLane = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0, false, 'ok', false, nil end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
 local V = {}
@@ -28,6 +28,23 @@ local function roadPoint(v) -- track coordinates -> world: a circle, x is the di
   local a = 2 * math.pi * v.z
   return vec3((R + v.x * 10) * math.cos(a), v.y, (R + v.x * 10) * math.sin(a))
 end
+local function trackPoint(p) -- world -> track coordinates, the inverse of roadPoint
+  return vec3((math.sqrt(p.x ^ 2 + p.z ^ 2) - R) / 10, p.y, frac((math.atan2 or math.atan)(p.z, p.x) / (2 * math.pi)))
+end
+
+-- The AI line of a pit lane like the one of an oval (ai/pit_lane.ai): on the road from 0.80, inside the
+-- road (30 m from its middle) from 0.87 over the line to 0.08, back on the road at 0.10, ends at 0.15.
+local function pitLaneFile()
+  local pts, d, prev = {}, 0, nil
+  for s = 0.80, 1.15, 2 / TRACK do
+    local x = s < 0.85 and 0 or s < 0.87 and -3 * (s - 0.85) / 0.02 or s < 1.08 and -3 or s < 1.10 and -3 * (1.10 - s) / 0.02 or 0
+    local p = roadPoint(vec3(x, 0, frac(s)))
+    if prev then d = d + math.sqrt((p.x - prev.x) ^ 2 + (p.z - prev.z) ^ 2) end
+    pts[#pts + 1], prev = string.pack('<fffff', p.x, p.y, p.z, d, 0), p
+  end
+  return string.pack('<i4i4i4i4', 7, #pts, 0, 0) .. table.concat(pts)
+end
+
 local dummy
 dummy = setmetatable({}, { __index = function() return dummy end, __call = function() return dummy end, __add = function() return dummy end })
 local function noop() end
@@ -92,7 +109,7 @@ local function newEnv(client, cfgOverride)
   for k in pairs(W.oldApi) do env.ac[k] = nil end -- pretend to be a CSP that lacks these functions
   if W.oldApi.structArray then StructItem.array = nil end
   client.texts, client.messages, client.penalties = {}, {}, {}
-  local gfx = { loads = {}, lights = {}, meshes = {} }
+  local gfx = { loads = {}, lights = {}, meshes = {}, wheels = {}, parts = {} }
   client.gfx = gfx
   local function node()
     local n = {}
@@ -100,7 +117,20 @@ local function newEnv(client, cfgOverride)
     function n:setPosition(p) self.pos = p; return self end
     function n:setOrientation(look, up) self.look, self.up = look, up; return self end
     function n:loadKN5Async(path, cb) gfx.loads[#gfx.loads + 1] = path; if W.modelFails then cb('no such file') else
-      cb(nil, { findMeshes = function(_, name)
+      cb(nil, { findNodes = function(_, name) -- the wheels: the right ones are mirrored in the model
+        local w = name:match('^WHEEL_(%u%u)$')
+        if not w then return { size = function() return 0 end } end
+        local raw = { side = { x = w:sub(1, 1) == 'R' and -1 or 1 } }
+        function raw:clone() return { side = self.side } end
+        function raw:set(m) self.angle = m.angle end
+        gfx.wheels[w] = raw
+        return { size = function() return 1 end, getTransformationRaw = function() return raw end }
+      end, findAny = function(_, name)
+        local n = { name = name, visible = true }
+        function n:setVisible(v) self.visible = v; return self end
+        gfx.parts[name] = n
+        return n
+      end, findMeshes = function(_, name)
         local m = gfx.meshes[name]
         if not m then
           m = { name = name, emissive = { r = 0 } }
@@ -117,6 +147,11 @@ local function newEnv(client, cfgOverride)
   env.ac.LightType = { Regular = 1 }
   env.ac.LightSource = function() local l = { color = { r = 0 } }; gfx.lights[#gfx.lights + 1] = l; return l end
   env.ac.trackCoordinateToWorld = roadPoint
+  env.ac.worldCoordinateToTrack = trackPoint
+  env.ac.getTrackAISplineSides = function() return { x = 10, y = 10 } end -- the road is 20 m wide
+  env.ac.getTrackDataFilename = function(name) return 'C:/ac/content/tracks/oval/data/' .. name end
+  env.io = { load = function(f) if f == 'C:/ac/content/tracks/oval/ai/pit_lane.ai' then return W.pitLane end end }
+  env.mat4x4 = { rotation = function(angle) return { angle = angle, mul = function(self) return self end } end }
   env.physics = { forceUserThrottleFor = function(time, level) -- the script's own gas cut (a penalty), or the limiter (short pulses)
     if W.penaltyFails then error('physics not available') end
     if time < 1 then client.limited = (client.limited or 0) + 1 return end
@@ -667,6 +702,50 @@ local function scenarioModel()
   check(#W.clients[2].gfx.loads == 0 and (W.clients[2].env.render.calls.debugArrow or 0) > 10, 'paceModel = empty: no model, arrow only')
 end
 
+local function scenarioPitLane()
+  print('== the pace car comes out of the pit lane and goes back in, its wheels turn')
+  resetWorld()
+  W.pitLane = pitLaneFile()
+  for i = 1, 6 do addCar(i, 0.55 - (i - 1) * 45 / TRACK, 200) end -- the leader at 0.55: the pit exit (0.09) is half a lap ahead
+  local cars = {}
+  for i, c in ipairs(W.cars) do cars[i] = c end
+  for _, c in ipairs(cars) do addClient(c, c.sessionID == 1) end
+  run(5)
+  local said = table.concat(W.logs, ' ')
+  check(said:find('Oval: pit lane', 1, true) ~= nil, 'the pit lane is found in the track files: ' .. (said:match('Oval: pit lane[^O]*') or '-'))
+  local cl = W.clients[2]
+  W.clients[1].chat('!yellow')
+  run(1)
+  local gfx, node = cl.gfx, function() return cl.gfx.node end
+  local function offRoad() local t = trackPoint(node().pos); return math.abs(t.x) * 10 end -- metres from the middle of the road
+  check(node().visible and offRoad() > 25 and shown(cl, 'PACE CAR LEAVING THE PITS'), 'it waits in the pit lane (' .. math.floor(offRoad()) .. ' m off the road), the HUD says so')
+  check((cl.env.render.calls.debugArrow or 0) > 0, 'and its point on the road is marked for the leader')
+  local w = gfx.wheels
+  local parked = w.LF.angle
+  run(2)
+  check(w.LF and w.RR and w.LF.angle == parked, 'standing still, its wheels do not turn')
+  local seenMoving, seenSpin = false, false
+  untilTrue(function()
+    local a = w.LF.angle
+    step()
+    seenMoving = seenMoving or (offRoad() > 25 and w.LF.angle ~= a)
+    seenSpin = seenSpin or (w.LF.angle ~= a and (w.LF.angle > 0) ~= (w.RF.angle > 0))
+    return offRoad() < 1
+  end, 200, 'the pace car on the road')
+  check(seenMoving and seenSpin, 'it drives off down the pit lane with turning wheels (the mirrored right ones the other way round in the model)')
+  check(gfx.parts.RIM_BLUR_LF.visible and not gfx.parts.RIM_LF.visible, 'at speed the blurred rims are shown')
+  run(5)
+  local s = cl.oval.pacePos()
+  check(math.abs(trackPoint(node().pos).z - s) < 1e-3 and offRoad() < 0.5, 'then it drives on its synced point on the road')
+  untilTrue(function() return cl.oval.state().phase == ONE_TO_GO end, 400, 'one to go')
+  local st = cl.oval.state()
+  check(math.abs(st.s0 - 0.80) < 0.01, string.format('one to go when it gets to the pit entry, not at 0.75 of the lap (%.3f)', st.s0))
+  local inPit = false
+  untilTrue(function() inPit = inPit or (node().visible and offRoad() > 25); return not node().visible end, 120, 'the pace car gone')
+  check(inPit, 'it turns into the pit lane and is gone once it has stopped there')
+  check(#W.errors == 0, 'no script errors' .. (W.errors[1] and (': ' .. W.errors[1]) or ''))
+end
+
 local function scenarioOldCsp()
   print('== an old CSP that lacks some functions')
   W.oldApi = { onOutgoingChatMessage = true, onSessionStart = true, configValues = true, getPatchVersionCode = true, onCarCollision = true }
@@ -944,6 +1023,7 @@ end
 scenarioManual()
 scenarioWreck()
 scenarioModel()
+scenarioPitLane()
 scenarioPenalties()
 scenarioGrid()
 scenarioRolling(true)
