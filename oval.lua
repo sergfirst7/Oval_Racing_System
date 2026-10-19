@@ -2,15 +2,17 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 9.4'
+local VERSION = 'Oval 10.0'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
 local cfgDefaults = {
   paceKmh = 100,       -- pace car speed
-  speedTolKmh = 8,     -- speed above the limit that still counts as fine
-  catchupKmh = 60,     -- extra speed allowed while closing a big gap to the car ahead
-  bunchGapM = 30,      -- gap to keep to the car ahead (or to the pace car)
+  speedTolKmh = 8,     -- speed above the target that still counts as fine
+  catchupKmh = 60,     -- extra speed allowed while closing a big gap to your place in the line
+  bunchGapM = 30,      -- gap between two places in the line (the leader keeps it to the pace car)
+  limiter = 1,         -- 1: the gas is cut above the target speed of your place (like a pit limiter), 0: off
+  offPaceSec = 3,      -- a car below 70 % of the pace for this long leaves the line, it rejoins where it is when back up to speed
   paceLeadM = 300,     -- how far ahead of the race leader the pace car appears
   autoCaution = 1,     -- 1: a wreck or a car stopped on track calls the caution automatically
   slowKmh = 40,        -- below this speed a car counts as stopped
@@ -29,8 +31,7 @@ local cfgDefaults = {
   rolling = 1,         -- 1: the race starts behind the pace car (rolling start); 0: standing start
   formationLaps = 1,   -- pace laps of the rolling start before the field may go green
   startLeadM = 40,     -- how far ahead of pole position the pace car starts
-  cautionLaps = 1,     -- pace laps before the field may be sent back to green
-  maxCautionLaps = 4,  -- restart anyway after this many pace laps
+  cautionLaps = 2,     -- pace laps of a caution: green at the line after 1.5..2.5 laps, nothing makes it longer
   oneToGoAt = 0.75,    -- the pace car leaves in the last quarter of a lap (track position 0..1), green at the line
   paceModel = 'content/cars/aston_vantage2018/aston_vantage2018.kn5', -- 3D model of the pace car, '' for the arrow marker only
   paceFlip = 0,        -- 1: turn the model around if it drives backwards
@@ -76,9 +77,12 @@ local S = freshState()
 local L1, watch, ctl = {}, {}, {} -- rules of the local car / incident watch of the local car / restart bookkeeping
 local pen, penNote, lastContact = { strikes = 0, last = {} }, nil, -100 -- penalties of the local car, the message about the last one, last contact
 local uiTime, lastClock, lastError, hudCars, hudRank, debugOn, greeted = 0, 0, nil, {}, 0, cfg.debug == 1, false
+local infoNote, followKey = nil, nil -- yellow pop-up (whom to follow now), the car we were last told to follow
+local offPace, slowT = {}, {} -- cars that fell out of the line (too slow for too long), how long each one has been slow
 
 local function adopt(new) -- local state survives order updates of the same deployment
   if new.phase ~= S.phase or new.tStart ~= S.tStart then L1, watch, ctl = {}, {}, {} end
+  if new.phase == GREEN then offPace, slowT, followKey = {}, {}, nil end
   if new.seq ~= S.seq or new.from ~= S.from then
     ac.log(string.format('Oval: state seq=%d from=%d phase=%d reason=%d cause=%d cars=%d clock=%d', new.seq, new.from, new.phase, new.reason, new.cause, #new.order, math.floor(clock())))
   end
@@ -140,7 +144,33 @@ local function commit(phase, reason, cause, tStart, s0, order)
   queue(S.seq, S.tStart, s0, S.kmh, phase, reason, cause, order)
 end
 
-local function pacePos() return frac(S.s0 + S.kmh / 3.6 * (clock() - S.tStart) / 1000 / trackLen()) end
+local function paceRun() return S.s0 + S.kmh / 3.6 * (clock() - S.tStart) / 1000 / trackLen() end -- laps, from the deployment point
+local function pacePos() return frac(paceRun()) end
+local function progress(c) return (c.lapCount or 0) + c.splinePosition end -- race distance in laps
+
+-- "a is ahead of b in the race" for sorting: the game's race position (lapped cars included) when
+-- every car has one, else laps + track position (one rule for all, a sort needs a consistent order)
+local function raceOrder(cars)
+  for _, c in pairs(cars) do
+    if (c.racePosition or 0) <= 0 then return function(a, b) return progress(a) > progress(b) end end
+  end
+  return function(a, b) return a.racePosition < b.racePosition end
+end
+
+-- Metres behind the pace car along the road. Under a caution the whole field is behind it, so there
+-- is no "0.95 lap ahead or 0.05 lap behind" question; the slack covers a car that edged past it.
+local SLACK = 150
+local function behindPace(c)
+  local len = trackLen()
+  return frac(pacePos() + SLACK / len - c.splinePosition) * len - SLACK
+end
+
+-- the pace car's crossings of the line so far, and the crossing that brings the green flag:
+-- the one after 1.5..2.5 laps (cautionLaps = 2), the first one of a rolling start
+local function greenLine()
+  local need = S.reason == 2 and cfg.formationLaps or cfg.cautionLaps
+  return math.floor(paceRun()), math.max(1, math.ceil(S.s0 + need - 0.5))
+end
 
 local function ahead(a, b) -- is car a ahead of car b in the race
   local pa, pb = a.racePosition or 0, b.racePosition or 0
@@ -161,7 +191,11 @@ local function deploy(reason, cause)
   for _, c in pairs(cars) do
     if not c.isInPitlane and not c.isRetired then list[#list + 1] = c end
   end
-  table.sort(list, function(x, y) return frac(s0 - x.splinePosition) < frac(s0 - y.splinePosition) end)
+  if reason == 2 then -- the grid order
+    table.sort(list, function(x, y) return frac(s0 - x.splinePosition) < frac(s0 - y.splinePosition) end)
+  else -- the race order: lapped cars go to the back of the line, so the line says who is ahead in the race
+    table.sort(list, raceOrder(list))
+  end
   local order = {}
   for i = 1, math.min(#list, ORDER_MAX) do order[i] = list[i].sessionID end
   commit(CAUTION, reason, cause, clock(), s0, order)
@@ -269,43 +303,100 @@ local function watchGamePenalty(me)
 end
 
 -- ── rules for the local car ──────────────────────────────────────────────────
--- Tracks the signed distance to the car we must follow (rel > 0: it is ahead). It is integrated
--- frame by frame, because on a ring "ahead by 0.95 lap" and "behind by 0.05 lap" look the same.
+-- Like the formation lap of ACC: every place in the line is a point that moves with the pace car
+-- (single file under a caution, two abreast after the grid). The target speed brings you to your
+-- point, not to the car ahead, so one car that slows down does not slow the whole field down.
+local function offPaceKmh() return 0.7 * cfg.paceKmh end
+local rowGap = { t = nil, m = 16 } -- metres between two rows of the rolling start, measured on the grid
+
+local function slotDistance(idx)
+  if S.reason == 2 then return cfg.startLeadM + math.floor((idx - 1) / 2) * rowGap.m end
+  return idx * cfg.bunchGapM
+end
+
+local function lapsDown(c, cars)
+  local lead = 0
+  for _, o in pairs(cars) do lead = math.max(lead, progress(o)) end
+  return math.floor(lead - progress(c))
+end
+
 local function localCheck(cars, dt)
   local me = ac.getCar(0)
   if S.phase == GREEN or me.isInPitlane then L1 = {} return end
-  local idx
-  for i, id in ipairs(S.order) do if id == me.sessionID then idx = i break end end
-  if not idx then L1 = {} return end
+  local at = {}
+  for i, id in ipairs(S.order) do at[id] = i end
+  local idx = at[me.sessionID]
+  if not idx then L1 = { out = true } return end -- out of the line: too slow, rejoins when back up to speed
 
   local launching = S.reason == 2 and clock() - S.tStart < 15000 -- cars still accelerate from the grid
-  local ref, key, refPos
-  for j = idx - 1, 1, -1 do -- nearest car ahead that is on track and moving
+  if S.reason == 2 and S.phase == CAUTION and rowGap.t ~= S.tStart then
+    local first, last, rows = cars[S.order[1]], cars[S.order[#S.order]], math.ceil(#S.order / 2) - 1
+    rowGap.t, rowGap.m = S.tStart, 16
+    if first and last and rows > 0 and clock() - S.tStart < 3000 then rowGap.m = clamp((behindPace(last) - behindPace(first)) / rows, 8, 40) end
+  end
+  local ref
+  for j = idx - 1, 1, -1 do -- nearest car ahead in the line that keeps the pace (a slow one may be passed)
     local c = cars[S.order[j]]
-    if c and not c.isInPitlane and (c.speedKmh > STOP_KMH or launching) then ref, key, refPos = c, c.sessionID, c.splinePosition break end
+    if c and not c.isInPitlane and (c.speedKmh > offPaceKmh() or launching) then ref = c break end
   end
-  if not ref and S.phase == CAUTION then key, refPos = 'pace', pacePos() end
-  if not refPos then -- leader after the pace car has left: hold the pace until the green flag
-    L1.rel, L1.passing, L1.lagging, L1.allowed = nil, false, false, cfg.paceKmh
-    L1.speeding = me.speedKmh > L1.allowed + cfg.speedTolKmh
-    return judge(dt)
+  local key = ref and ref.sessionID or 'pace'
+  if L1.key ~= key then L1 = { key = key } end
+  local myD = behindPace(me)
+  local rel = myD - (ref and behindPace(ref) or 0) -- > 0: the car (or pace car) we follow is ahead
+  if L1.rel and math.abs(rel - L1.rel) > 200 then L1.seenAhead = nil end -- a jump: it went round the pace car, it did not pass us
+  if rel > 0 then L1.seenAhead = true end -- only a car we have been behind can be passed
+
+  local mate = S.reason == 2 and idx % 2 == 0 and S.order[idx - 1] or nil -- the row mate on the rolling start
+  -- within 150 m: the nearest car ahead of us on the road and in the line that we must not run into, the
+  -- nearest one to pass (behind us in the line, or too slow: we go round it, braking for it is what makes
+  -- the whole field pile up) and the nearest one to let by (ahead of us in the line but behind on the road)
+  local block, passIt, letIt, dBlock, dPass, dLet = nil, nil, nil, 150, 150, 150
+  for id, c in pairs(cars) do
+    local i = at[id]
+    if i and id ~= me.sessionID and not c.isInPitlane then
+      local d = myD - behindPace(c) -- > 0: it is ahead of us on the road
+      local slow = not launching and c.speedKmh < offPaceKmh()
+      if i < idx and not slow and d > 0 and d < dBlock and id ~= mate then block, dBlock = c, d end
+      if (i > idx or slow) and d > 0 and d < dPass then passIt, dPass = c, d end
+      if i < idx and d < 0 and -d < dLet and (c ~= ref or not L1.seenAhead) then letIt, dLet = c, -d end
+    end
   end
 
-  local len, raw = trackLen(), refPos - me.splinePosition
-  if L1.key ~= key or not L1.rel then
-    L1.rel = frac(raw) * len -- first sight: the reference is ahead by definition of the order
-  else
-    local d = raw - L1.raw
-    L1.rel = L1.rel + (d - math.floor(d + 0.5)) * len
+  local gap, speed = cfg.bunchGapM, me.speedKmh
+  local err = myD - slotDistance(idx) -- > 0: behind our place
+  local target = cfg.paceKmh + (err > 0 and clamp(err / (4 * gap), 0, 1) * cfg.catchupKmh or clamp(err / gap, -1, 0) * 20)
+  if block then -- never into the car ahead: slow down early and gently (3 m/s2), not at the last moment
+    local keep = S.reason == 2 and 0.6 * rowGap.m or 0.75 * gap
+    target = math.min(target, block.speedKmh + 3.6 * math.sqrt(6 * math.max(0, dBlock - keep)))
   end
-  L1.key, L1.raw, L1.ref = key, raw, ref
+  local tol = S.reason == 2 and -12 or -3 -- the grid is two abreast, a few metres either way are fine
+  local leaderGo = not ref and S.phase == ONE_TO_GO -- the pace car is gone, the leader holds the pace to the line
 
-  local speed = me.speedKmh
-  L1.allowed = cfg.paceKmh + clamp((L1.rel - cfg.bunchGapM) / (4 * cfg.bunchGapM), 0, 1) * cfg.catchupKmh
-  L1.speeding = speed > L1.allowed + cfg.speedTolKmh
-  L1.passing = L1.rel < (S.reason == 2 and -12 or -3) -- the grid is two abreast, a few metres either way are fine
-  L1.lagging = L1.rel > 4 * cfg.bunchGapM and speed < cfg.paceKmh - 20
+  L1.ref, L1.place, L1.count, L1.rel, L1.err, L1.beside = ref, idx, #S.order, rel, err, ref ~= nil and ref.sessionID == mate
+  L1.target, L1.allowed = target, target + cfg.speedTolKmh
+  L1.speeding = speed > L1.allowed
+  L1.passing = not leaderGo and L1.seenAhead == true and rel < tol
+  L1.passIt, L1.letIt = passIt, not L1.passing and letIt or nil
+  L1.tooClose = block ~= nil and S.reason ~= 2 and dBlock < 0.4 * gap
+  L1.lagging = not launching and err > 2 * gap and speed < target - 15
+  L1.down, L1.refDown = lapsDown(me, cars), ref and lapsDown(ref, cars) or 0
+  if key ~= followKey then -- say it loud whenever the car to follow changes
+    followKey = key
+    local name = ref and ac.getDriverName(ref.index) .. (L1.refDown > 0 and ' (LAPPED)' or '')
+    infoNote = { title = name and 'FOLLOW ' .. name or leaderGo and 'YOU LEAD THE FIELD' or 'FOLLOW THE PACE CAR', why = string.format('YOUR PLACE IN THE LINE: %d OF %d', idx, #S.order), untilT = uiTime + 6 }
+  end
   judge(dt)
+end
+
+-- The limiter cuts the gas while the car is faster than the target of its place (works on the
+-- script's own throttle override, like the gas cut penalty). A running penalty gas cut is left alone.
+local limitLogged = false
+local function limit(me)
+  if cfg.limiter ~= 1 or not L1.target or me.isInPitlane or uiTime - (pen.slowAt or -100) < cfg.slowSec then return end
+  L1.limiting = me.speedKmh > L1.target + 2
+  if not L1.limiting then return end
+  local good, err = pcall(function() physics.forceUserThrottleFor(0.15, 0) end)
+  if not good and not limitLogged then limitLogged = true; ac.log('Oval: limiter unavailable: ' .. tostring(err)) end
 end
 
 -- ── incidents: every client watches its own car ──────────────────────────────
@@ -361,7 +452,7 @@ end
 -- ── restart handling: every client computes it, the lowest session ID acts first ─────────
 -- A client only acts after `rank * RANK_DELAY` seconds without a newer state, so a car whose
 -- driver has no script cannot stall the flow: the next one takes over.
-local pend, lastLeader, bunchT = { key = nil }, nil, 0
+local pend, lastLeader = { key = nil }, nil
 local start = {}
 local function due(key, rank)
   if pend.key ~= key or pend.seq ~= S.seq or uiTime - pend.last > 0.5 then pend = { key = key, seq = S.seq, at = uiTime } end
@@ -369,39 +460,34 @@ local function due(key, rank)
   return uiTime - pend.at >= rank * RANK_DELAY
 end
 
-local function stoppedOnTrack(c) return not c.isInPitlane and not c.isRetired and c.speedKmh < STOP_KMH end
 local function moving(c) return not c.isInPitlane and not c.isRetired and c.speedKmh > STOP_KMH end
 
-local function hazard(cars)
-  for _, c in pairs(cars) do if stoppedOnTrack(c) then return true end end
-end
-
--- every moving car within 2 gaps of the one ahead, the leader within 3 gaps of the pace car
-local function bunched(cars)
-  local len, prev, limit = trackLen(), pacePos(), 3 * cfg.bunchGapM
-  for _, id in ipairs(S.order) do
-    local c = cars[id]
-    if c and moving(c) then
-      if frac(prev - c.splinePosition) * len > limit then return false end
-      prev, limit = c.splinePosition, 2 * cfg.bunchGapM
-    end
+-- A car below 70 % of the pace for offPaceSec (stopped, wrecked, limping) leaves the line, so
+-- the cars behind it pass it and keep the pace. Back up to speed, it rejoins where it is.
+local function watchPace(cars, dt)
+  local launching = S.reason == 2 and clock() - S.tStart < 15000
+  for id, c in pairs(cars) do
+    local slow = not launching and not c.isInPitlane and not c.isRetired and c.speedKmh < offPaceKmh()
+    slowT[id] = slow and (slowT[id] or 0) + dt or 0
+    if slowT[id] >= cfg.offPaceSec then offPace[id] = true elseif not slow then offPace[id] = nil end
   end
-  return true
 end
 
--- Cars that left for the pits drop out of the order; cars that come back (or join) take the
--- place where they rejoined the pack, so nobody can gain places by pitting. nil: nothing changed.
+-- Cars in the pits or out of the line drop out of the order; cars that come back (or join) take
+-- their place by the race order (by the road on the rolling start), so nobody gains places by
+-- pitting or by stopping. nil: nothing changed.
 local function desiredOrder(cars)
-  local order, seen, p = {}, {}, pacePos()
-  local function behind(c) return frac(p - c.splinePosition) end
+  local order, seen = {}, {}
+  local function inLine(id, c) return not c.isInPitlane and not c.isRetired and not offPace[id] end
+  local before = S.reason == 2 and function(a, b) return behindPace(a) < behindPace(b) end or raceOrder(cars)
   for _, id in ipairs(S.order) do
     local c = cars[id]
-    if c and not c.isInPitlane and not c.isRetired then order[#order + 1] = id; seen[id] = true end
+    if c and inLine(id, c) then order[#order + 1] = id; seen[id] = true end
   end
   for id, c in pairs(cars) do
-    if not seen[id] and not c.isInPitlane and not c.isRetired then
+    if not seen[id] and inLine(id, c) then
       local at = #order + 1
-      for i, other in ipairs(order) do if behind(cars[other]) > behind(c) then at = i break end end
+      for i, other in ipairs(order) do if before(c, cars[other]) then at = i break end end
       table.insert(order, at, id)
     end
   end
@@ -424,7 +510,8 @@ local function leaderCrossed(cars)
 end
 
 local function control(cars, dt, rank)
-  if S.phase == GREEN then lastLeader, bunchT = nil, 0 return end
+  if S.phase == GREEN then lastLeader = nil return end
+  watchPace(cars, dt)
   if not cars[S.from] then -- the sender is gone: say it again, late joiners need it
     if due('announce', rank) then commit(S.phase, S.reason, S.cause, S.tStart, S.s0, S.order) end
     return
@@ -434,13 +521,10 @@ local function control(cars, dt, rank)
 
   local len = trackLen()
   if S.phase == CAUTION then
-    local laps = S.kmh / 3.6 * (clock() - S.tStart) / 1000 / len
-    local need = S.reason == 2 and cfg.formationLaps or cfg.cautionLaps
-    if bunched(cars) and not hazard(cars) then bunchT = bunchT + dt else bunchT = 0 end
+    -- a fixed length: neither a car standing on track nor a gap in the line makes the caution longer
+    local crossed, greenAt = greenLine()
     local pos = pacePos()
-    -- laps counted up to the line where the flag will turn green; a tenth of a lap of slack for the head start
-    local ready = laps >= cfg.maxCautionLaps or (laps + 1 - pos >= need - 0.1 and bunchT > 1.5)
-    if ready and pos >= cfg.oneToGoAt and due('one', rank) then -- the pace car pulls off before the last turns
+    if crossed >= greenAt - 1 and pos >= cfg.oneToGoAt and due('one', rank) then -- the pace car pulls off before the last turns
       commit(ONE_TO_GO, S.reason, S.cause, clock(), pos, S.order)
     end
     return
@@ -466,7 +550,10 @@ local function sessionType()
   return good and sess and sess.type or nil
 end
 local function isActive() return cfg.everySession == 1 or sessionType() == RACE end
-local function reset() S, L1, watch, ctl, start, greeted, pen, penNote = freshState(), {}, {}, {}, {}, false, { strikes = 0, last = {} }, nil end
+local function reset()
+  S, L1, watch, ctl, start, greeted, pen, penNote = freshState(), {}, {}, {}, {}, false, { strikes = 0, last = {} }, nil
+  infoNote, followKey, offPace, slowT = nil, nil, {}, {}
+end
 try('session start events', ac.onSessionStart, reset)
 
 -- Chat commands: !ovaldebug (anyone, only for yourself), !yellow / !green (admin)
@@ -644,6 +731,7 @@ function script.update(dt)
     if S.phase == GREEN then startRace(cars, rank, now); watchSelf(dt, now) end
     control(cars, dt, rank)
     localCheck(cars, dt)
+    limit(me)
     servePenalty(me)
     handOutOwed()
     watchGamePenalty(me)
@@ -652,7 +740,7 @@ function script.update(dt)
 end
 
 -- ── HUD ──────────────────────────────────────────────────────────────────────
-local GREENC, RED, BLACK = rgbm(0.1, 0.75, 0.2, 0.95), rgbm(0.9, 0.1, 0.1, 0.95), rgbm(0, 0, 0, 1)
+local GREENC, RED, BLACK, BLUE = rgbm(0.1, 0.75, 0.2, 0.95), rgbm(0.9, 0.1, 0.1, 0.95), rgbm(0, 0, 0, 1), rgbm(0.1, 0.35, 0.9, 0.95)
 
 local function centered(text, size, cx, y, color)
   ui.dwriteDrawText(text, size, vec2(cx - ui.measureDWriteText(text, size).x / 2, y), color)
@@ -697,35 +785,67 @@ function script.drawUI()
       ui.drawRectFilled(vec2(win.x / 2 - 300 * k1, win.y * 0.8), vec2(win.x / 2 + 300 * k1, win.y * 0.8 + 44 * k1), RED, 10 * k1)
       centered(debt, 22 * k1, win.x / 2, win.y * 0.8 + 8 * k1, rgbm(1, 1, 1, 1))
     end
+    local k, cx = win.y / 1080, win.x / 2
+    if infoNote and uiTime < infoNote.untilT and not (penNote and uiTime < penNote.untilT) then -- whom to follow, in big letters
+      local y0 = win.y * 0.3
+      ui.drawRectFilled(vec2(cx - 320 * k, y0), vec2(cx + 320 * k, y0 + 100 * k), YELLOW, 12 * k)
+      centered(infoNote.title, 36 * k, cx, y0 + 10 * k, BLACK)
+      centered(infoNote.why, 22 * k, cx, y0 + 62 * k, BLACK)
+    end
     local showGreen = S.phase == GREEN and S.seq > 0 and clock() - S.tStart < 5000
     if S.phase == GREEN and not showGreen then return end
 
-    local k, cx, y = win.y / 1080, win.x / 2, 50 * win.y / 1080
-    local title, note, bg = 'GREEN FLAG', nil, GREENC
+    local y = 50 * k
+    local title, bg, lines = 'GREEN FLAG', GREENC, {}
     if S.phase == ONE_TO_GO then
-      title, note, bg = 'ONE TO GO', 'GREEN AT THE START/FINISH LINE', YELLOW
+      title, bg, lines[1] = 'ONE TO GO', YELLOW, 'GREEN AT THE START/FINISH LINE'
     elseif S.phase == CAUTION then
       title, bg = TITLES[S.reason] or 'CAUTION', YELLOW
       local who = hudCars[S.cause]
-      note = S.reason == 2 and 'HOLD YOUR POSITION - GREEN AT THE LINE' or who and ac.getDriverName(who.index)
+      lines[1] = S.reason == 2 and 'HOLD YOUR ROW - GREEN AT THE LINE' or who and ac.getDriverName(who.index) or nil
     end
-    local h = 44 + (note and 24 or 0) + (showGreen and 0 or 28 + (L1.allowed and 32 or 0))
-    ui.drawRectFilled(vec2(cx - 250 * k, y), vec2(cx + 250 * k, y + h * k), bg, 10 * k)
+    if not showGreen then
+      if L1.out then
+        lines[#lines + 1] = 'OUT OF THE LINE: GET BACK UP TO SPEED'
+      elseif L1.place then
+        local place = string.format('PLACE %d OF %d IN THE LINE', L1.place, L1.count)
+        if S.reason == 2 then place = string.format('ROW %d   ', math.ceil(L1.place / 2)) .. place end
+        if S.phase == CAUTION then
+          local crossed, at = greenLine()
+          place = place .. string.format('     GREEN IN %d LAP%s', at - crossed, at - crossed == 1 and '' or 'S')
+        end
+        lines[#lines + 1] = place
+        lines[#lines + 1] = L1.ref and (L1.beside and 'BESIDE  ' or 'FOLLOW  ') .. ac.getDriverName(L1.ref.index) .. (L1.refDown > 0 and '  (LAPPED)' or '')
+          or S.phase == ONE_TO_GO and 'YOU LEAD: HOLD THE PACE, GO AT THE LINE' or 'FOLLOW THE PACE CAR'
+        if L1.passIt then lines[#lines + 1] = 'PASS  ' .. ac.getDriverName(L1.passIt.index) .. (L1.passIt.speedKmh < offPaceKmh() and '  (TOO SLOW)' or '  (BEHIND YOU IN THE LINE)') end
+      end
+    end
+    local bar = not showGreen and L1.target ~= nil
+    local h = 44 + #lines * 24 + (bar and 58 or 0)
+    ui.drawRectFilled(vec2(cx - 320 * k, y), vec2(cx + 320 * k, y + h * k), bg, 10 * k)
     centered(title, 30 * k, cx, y + 6 * k, BLACK)
     if showGreen then return end
 
     local yy = y + 44 * k
-    if note then centered(note, 17 * k, cx, yy, BLACK); yy = yy + 24 * k end
-    local follow = L1.ref and 'FOLLOW  ' .. ac.getDriverName(L1.ref.index) or S.phase == ONE_TO_GO and 'YOU SET THE PACE' or 'FOLLOW  PACE CAR'
-    centered(follow, 18 * k, cx, yy, BLACK)
-    if L1.allowed then
-      local gap = L1.rel and string.format('%d m     ', math.floor(math.max(L1.rel, 0) + 0.5)) or ''
-      centered(string.format('%s%d / %d km/h', gap, math.floor(ac.getCar(0).speedKmh), math.floor(L1.allowed + 0.5)),
-        22 * k, cx, yy + 28 * k, (L1.speeding or L1.passing) and RED or BLACK)
+    for _, line in ipairs(lines) do centered(line, 18 * k, cx, yy, BLACK); yy = yy + 24 * k end
+    if bar then -- where we are against our place: the marker right of the middle = ahead of it
+      local half, err = 200 * k, L1.err
+      local mx = cx + clamp(-err, -60, 60) / 60 * half
+      ui.drawRectFilled(vec2(cx - half, yy + 2 * k), vec2(cx + half, yy + 14 * k), rgbm(0, 0, 0, 0.6), 4 * k)
+      ui.drawRectFilled(vec2(cx - half / 6, yy + 2 * k), vec2(cx + half / 6, yy + 14 * k), GREENC, 4 * k) -- +-10 m
+      ui.drawRectFilled(vec2(mx - 4 * k, yy - 2 * k), vec2(mx + 4 * k, yy + 18 * k), math.abs(err) <= 10 and BLACK or RED, 2 * k)
+      local say = err > 10 and string.format('SPEED UP  %d m', math.floor(err + 0.5)) or err < -10 and string.format('BACK OFF  %d m', math.floor(-err + 0.5)) or 'IN POSITION'
+      centered(string.format('%s     %d / %d km/h%s', say, math.floor(ac.getCar(0).speedKmh), math.floor(L1.target + 0.5), L1.limiting and '  LIMITER' or ''),
+        20 * k, cx, yy + 24 * k, (L1.speeding or L1.passing) and RED or BLACK)
     end
-    local warn = L1.passing and 'DO NOT PASS - DROP BACK' or L1.speeding and 'SLOW DOWN' or L1.lagging and 'CLOSE THE GAP'
+    local warn, wbg = nil, RED
+    if L1.passing then warn = 'DO NOT PASS - DROP BACK'
+    elseif L1.letIt then warn, wbg = 'LET ' .. ac.getDriverName(L1.letIt.index) .. ' BY - AHEAD OF YOU IN THE LINE', BLUE
+    elseif L1.tooClose then warn = 'TOO CLOSE - BACK OFF'
+    elseif L1.speeding then warn = 'SLOW DOWN'
+    elseif L1.lagging then warn = 'SPEED UP - CLOSE THE GAP' end
     if warn then
-      ui.drawRectFilled(vec2(cx - 250 * k, y + (h + 6) * k), vec2(cx + 250 * k, y + (h + 46) * k), RED, 10 * k)
+      ui.drawRectFilled(vec2(cx - 320 * k, y + (h + 6) * k), vec2(cx + 320 * k, y + (h + 46) * k), wbg, 10 * k)
       centered(warn, 24 * k, cx, y + (h + 12) * k, rgbm(1, 1, 1, 1))
     end
   end)()
@@ -740,4 +860,4 @@ pcall(function() ac.log(string.format('Oval: %s loaded, CSP %s, me=%d cars=%d ra
 pcall(function() local s = ac.getSession(sim.currentSessionIndex); ac.log(string.format('Oval: session laps=%s timed=%s minutes=%s', tostring(s.laps), tostring(s.isTimedRace), tostring(s.durationMinutes))) end)
 
 -- Offline tests load this file with a fake `ac` and read the internals from here.
-if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, pen = function() return pen end, note = function() return penNote end, stats = function() return stats end } end
+if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, pen = function() return pen end, note = function() return penNote end, info = function() return infoNote end, stats = function() return stats end } end
