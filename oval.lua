@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 10.2'
+local VERSION = 'Oval 10.3'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -308,12 +308,12 @@ local function judge(dt)
   L1.passT = L1.passing and not free and (L1.passT or 0) + dt or 0
   if L1.speedT >= cfg.speedSec then
     L1.speedT = 0
-    penalize(S.phase == ONE_TO_GO and 'Завелика швидкість перед зеленим прапором' or 'Перевищення швидкості за пейс-каром', 1)
+    penalize(S.phase == ONE_TO_GO and 'Завелика швидкість перед зеленим прапором' or 'Перевищення швидкості за safety car', 1)
   end
   if L1.passT >= cfg.passSec then
     L1.passT = 0
     local pace, restart = L1.key == 'pace', S.phase == ONE_TO_GO
-    penalize(pace and 'Обгін пейс-кара' or restart and 'Фальстарт на рестарті' or 'Обгін під жовтим прапором', (pace or restart) and 2 or 1)
+    penalize(pace and 'Обгін safety car' or restart and 'Фальстарт на рестарті' or 'Обгін під жовтим прапором', (pace or restart) and 2 or 1)
   end
 end
 
@@ -437,7 +437,7 @@ local function localCheck(cars, dt)
   if key ~= followKey then -- say it loud whenever the car to follow changes
     followKey = key
     local name = ref and ac.getDriverName(ref.index) .. (L1.refDown > 0 and LAPPED or '')
-    infoNote = { title = name and 'ЇДЬ ЗА ' .. name or leaderGo and 'ТИ ВЕДЕШ КОЛОНУ' or 'ЇДЬ ЗА ПЕЙС-КАРОМ', why = string.format('ТВОЄ МІСЦЕ В КОЛОНІ: %d З %d', idx, #S.order), place = idx, count = #S.order, untilT = uiTime + 6 }
+    infoNote = { title = name and 'ЇДЬ ЗА ' .. name or leaderGo and 'ТИ ВЕДЕШ КОЛОНУ' or 'ЇДЬ ЗА SAFETY CAR', why = string.format('ТВОЄ МІСЦЕ В КОЛОНІ: %d З %d', idx, #S.order), place = idx, count = #S.order, untilT = uiTime + 6 }
   end
   judge(dt)
 end
@@ -814,14 +814,14 @@ local function drawPaceCar()
   local f = car3d.frame
   if f and car3d.state ~= 'ready' then -- no model: an arrow and a label
     render.debugArrow(f.p + vec3(0, 14, 0), f.p + vec3(0, 2, 0), 1.5, YELLOW)
-    render.debugText(f.p + vec3(0, 16, 0), 'ПЕЙС-КАР', YELLOW, 2)
+    render.debugText(f.p + vec3(0, 16, 0), 'SAFETY CAR', YELLOW, 2)
   elseif f then
-    render.debugText(f.p + f.up * 3.6, 'ПЕЙС-КАР', YELLOW, 1.5)
+    render.debugText(f.p + f.up * 3.6, 'SAFETY CAR', YELLOW, 1.5)
   end
   if car3d.inPits and S.phase == CAUTION then -- the leader follows its point on the road while it is still in the pits
     local q = ac.trackCoordinateToWorld(vec3(0, 0, pacePos()))
     render.debugArrow(q + vec3(0, 14, 0), q + vec3(0, 2, 0), 1.5, YELLOW)
-    render.debugText(q + vec3(0, 16, 0), 'ПЕЙС-КАР ВИЇЖДЖАЄ З БОКСІВ', YELLOW, 2)
+    render.debugText(q + vec3(0, 16, 0), 'SAFETY CAR ВИЇЖДЖАЄ З БОКСІВ', YELLOW, 2)
   end
 end
 
@@ -1010,7 +1010,7 @@ function script.drawUI()
       title, bg = TITLES[S.reason] or TITLES[0], YELLOW
       local who = hudCars[S.cause]
       if S.reason == 2 then add('ТРИМАЙ СВІЙ РЯД - ЗЕЛЕНИЙ НА ЛІНІЇ') elseif who then add(ac.getDriverName(who.index)) end
-      if car3d.inPits then add('ПЕЙС-КАР ВИЇЖДЖАЄ З БОКСІВ - ТРИМАЙ ТЕМП') end
+      if car3d.inPits then add('SAFETY CAR ВИЇЖДЖАЄ З БОКСІВ - ТРИМАЙ ТЕМП') end
     end
     if not showGreen and not demo then
       if L1.out then
@@ -1031,7 +1031,7 @@ function script.drawUI()
         if L1.ref then
           lines[#lines + 1] = { { L1.beside and 'ПОРУЧ З  ' or 'ЇДЬ ЗА  ', 18 }, { ac.getDriverName(L1.ref.index), 26 }, { L1.refDown > 0 and LAPPED or '', 18 } }
         else
-          add(S.phase == ONE_TO_GO and 'ТИ ЛІДЕР: ТРИМАЙ ТЕМП, ГАЗ НА ЛІНІЇ' or 'ЇДЬ ЗА ПЕЙС-КАРОМ')
+          add(S.phase == ONE_TO_GO and 'ТИ ЛІДЕР: ТРИМАЙ ТЕМП, ГАЗ НА ЛІНІЇ' or 'ЇДЬ ЗА SAFETY CAR')
         end
         if L1.passIt then add('ОБЖЕНИ  ' .. ac.getDriverName(L1.passIt.index) .. (L1.passIt.speedKmh < offPaceKmh() and '  (ЗАНАДТО ПОВІЛЬНИЙ)' or '  (ПОЗАДУ ТЕБЕ В КОЛОНІ)')) end
       end

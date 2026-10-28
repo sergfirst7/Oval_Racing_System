@@ -718,7 +718,7 @@ local function scenarioPitLane()
   run(1)
   local gfx, node = cl.gfx, function() return cl.gfx.node end
   local function offRoad() local t = trackPoint(node().pos); return math.abs(t.x) * 10 end -- metres from the middle of the road
-  check(node().visible and offRoad() > 25 and shown(cl, 'ПЕЙС-КАР ВИЇЖДЖАЄ З БОКСІВ'), 'it waits in the pit lane (' .. math.floor(offRoad()) .. ' m off the road), the HUD says so')
+  check(node().visible and offRoad() > 25 and shown(cl, 'SAFETY CAR ВИЇЖДЖАЄ З БОКСІВ'), 'it waits in the pit lane (' .. math.floor(offRoad()) .. ' m off the road), the HUD says so')
   check((cl.env.render.calls.debugArrow or 0) > 0, 'and its point on the road is marked for the leader')
   local w = gfx.wheels
   local parked = w.LF.angle
@@ -905,7 +905,7 @@ local function scenarioPenalties()
   W.clients[1].chat('!yellow')
   b2[1].hold = 106 -- the leader keeps just under the limit and creeps past the pace car
   run(30)
-  check(kinds(W.clients[1]):sub(1, 6) == 'GasCut' and W.clients[1].messages[1]:find('Обгін пейс-кара', 1, true), 'a gas cut at the very first violation: ' .. (W.clients[1].messages[1] or '-'))
+  check(kinds(W.clients[1]):sub(1, 6) == 'GasCut' and W.clients[1].messages[1]:find('Обгін safety car', 1, true), 'a gas cut at the very first violation: ' .. (W.clients[1].messages[1] or '-'))
 
   print('== being pushed is no fault')
   speeder()
