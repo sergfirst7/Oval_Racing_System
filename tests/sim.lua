@@ -473,7 +473,7 @@ local function scenarioStraggler()
   local at = W.t
   byId[1].isInPitlane = true
   run(20)
-  check(shown(sc, 'SPEED UP') and sc.oval.local1().target > 115, 'the straggler sees SPEED UP and a target above the pace (' .. math.floor(sc.oval.local1().target) .. ' km/h)')
+  check(shown(sc, 'ДОДАЙ') and sc.oval.local1().target > 115, 'the straggler sees SPEED UP and a target above the pace (' .. math.floor(sc.oval.local1().target) .. ' km/h)')
   untilTrue(function() return W.clients[2].oval.state().phase == GREEN end, 400, 'the green flag')
   print(string.format('     green after %.0f s of caution', W.t - at))
   check(W.t - at < 250, 'green after at most 2.5 pace laps, although the straggler is still far back')
@@ -487,7 +487,7 @@ local function scenarioGiveUp()
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 30, 'the caution')
   local at = W.t
   run(10)
-  check(W.clients[3].oval.local1().out == true and shown(W.clients[3], 'OUT OF THE LINE'), 'the stopped car is out of the line and its driver is told so')
+  check(W.clients[3].oval.local1().out == true and shown(W.clients[3], 'ПОЗА КОЛОНОЮ'), 'the stopped car is out of the line and its driver is told so')
   untilTrue(function() return W.clients[1].oval.state().phase == GREEN end, 400, 'the green flag')
   check(W.t - at > 130 and W.t - at < 250, 'green after about two pace laps (' .. math.floor(W.t - at) .. ' s), the car is still standing')
   byId[3].stopped = false
@@ -718,7 +718,7 @@ local function scenarioPitLane()
   run(1)
   local gfx, node = cl.gfx, function() return cl.gfx.node end
   local function offRoad() local t = trackPoint(node().pos); return math.abs(t.x) * 10 end -- metres from the middle of the road
-  check(node().visible and offRoad() > 25 and shown(cl, 'PACE CAR LEAVING THE PITS'), 'it waits in the pit lane (' .. math.floor(offRoad()) .. ' m off the road), the HUD says so')
+  check(node().visible and offRoad() > 25 and shown(cl, 'ПЕЙС-КАР ВИЇЖДЖАЄ З БОКСІВ'), 'it waits in the pit lane (' .. math.floor(offRoad()) .. ' m off the road), the HUD says so')
   check((cl.env.render.calls.debugArrow or 0) > 0, 'and its point on the road is marked for the leader')
   local w = gfx.wheels
   local parked = w.LF.angle
@@ -780,7 +780,7 @@ local function scenarioOldCsp()
   W.oldApi = {}
   run(2)
   local warned2 = false
-  for _, tx in ipairs(W.clients[1].texts) do warned2 = warned2 or tx:find('no online events', 1, true) ~= nil end
+  for _, tx in ipairs(W.clients[1].texts) do warned2 = warned2 or tx:find('немає online events', 1, true) ~= nil end
   check(warned2 and #W.errors == 0, 'the script loads, tells the player, and does not fail')
 
   print('== old CSP: the session type comes from the session')
@@ -806,7 +806,7 @@ local function scenarioOldCsp()
   cl.texts = {}
   cl.env.script.drawUI()
   local shown = false
-  for _, tx in ipairs(cl.texts) do shown = shown or tx:find('OVAL error', 1, true) ~= nil end
+  for _, tx in ipairs(cl.texts) do shown = shown or tx:find('OVAL помилка', 1, true) ~= nil end
   check(shown, 'the player and whoever looks at his screen can read what failed')
   W.errors = {} -- that error was on purpose
 
@@ -816,7 +816,7 @@ local function scenarioOldCsp()
   W.oldApi = {}
   run(2)
   local warned = false
-  for _, tx in ipairs(W.clients[1].texts) do warned = warned or tx:find('no online events', 1, true) ~= nil end
+  for _, tx in ipairs(W.clients[1].texts) do warned = warned or tx:find('немає online events', 1, true) ~= nil end
   check(warned, 'the player is told that the flag cannot reach him')
 end
 
@@ -841,7 +841,7 @@ local function scenarioPenalties()
   check(kinds(me):sub(1, 6) == 'GasCut' and me.penalties[1].t - y > 8 and me.penalties[1].param == 5 and me.penalties[1].level == 0, 'first a warning, then a gas cut: the throttle forced to 0 for 5 s (' .. kinds(me) .. string.format(', first after %.1f s', (me.penalties[1] or { t = 0 }).t - y) .. ', ' .. table.concat(me.messages, ' | ') .. ')')
   check(not kinds(me):find('MandatoryPits', 1, true) and me.oval.pen().owed == true, 'the third violation does not hand out a drive-through now (the caution is over before it can be served): it is put on the account')
   local shown = false
-  for _, tx in ipairs(me.texts) do shown = shown or tx:find('DRIVE-THROUGH DUE AFTER THE GREEN FLAG', 1, true) ~= nil end
+  for _, tx in ipairs(me.texts) do shown = shown or tx:find('ПРОЇЗД ПІТ-ЛЕЙНУ ПІСЛЯ ЗЕЛЕНОГО ПРАПОРА', 1, true) ~= nil end
   check(shown, 'and the driver is told about it on the screen')
   for id, cl in ipairs(W.clients) do if id ~= 5 then check(#cl.penalties == 0, 'client ' .. id .. ' followed the rules and was not punished') end end
   check((me.limited or 0) > 30, 'the limiter cut the gas of the car that was too fast (' .. (me.limited or 0) .. ' pulses)')
@@ -853,7 +853,7 @@ local function scenarioPenalties()
   local last = me.penalties[#me.penalties]
   check(last.kind == 'MandatoryPits' and last.param == 3 and me.oval.pen().driving == true and not me.oval.pen().owed, 'the green flag hands it out: 3 laps to serve')
   shown = false
-  for _, tx in ipairs(me.texts) do shown = shown or tx:find('DRIVE-THROUGH: ENTER THE PIT LANE', 1, true) ~= nil end
+  for _, tx in ipairs(me.texts) do shown = shown or tx:find('ПРОЇЗД ПІТ-ЛЕЙНУ: ЗАЇЖДЖАЙ НА ПІТ-ЛЕЙН', 1, true) ~= nil end
   check(shown, 'and the screen says what to do')
   byId[5].isInPitlane = true; run(3); byId[5].isInPitlane = false; run(1)
   check(me.oval.pen().driving == false, 'a drive-through is served after a run through the pit lane')
@@ -877,7 +877,7 @@ local function scenarioPenalties()
   check(cl.oval.pen().driving == true and seen and where, 'what the game says about the drive-through, and where it was handed out, is in the log')
   cl.car.currentPenaltyType, other.car.currentPenaltyType = 4, 4 -- the game loses patience with both
   run(3)
-  check(kinds(cl):sub(-16) == 'ReleaseBlackFlag' and cl.oval.pen().driving == false and noteOf(cl) == 'BLACK FLAG RELEASED', 'the driver of the drive-through is set free again')
+  check(kinds(cl):sub(-16) == 'ReleaseBlackFlag' and cl.oval.pen().driving == false and noteOf(cl) == 'ЧОРНИЙ ПРАПОР ЗНЯТО', 'the driver of the drive-through is set free again')
   local releases = 0
   for _, p in ipairs(cl.penalties) do if p.kind == 'ReleaseBlackFlag' then releases = releases + 1 end end
   check(releases == 1 and kinds(other) == '', 'once, and a black flag that is not ours is left alone')
@@ -887,12 +887,12 @@ local function scenarioPenalties()
   run(40) -- the first cut comes after 10 s, it runs for 30
   local cuts = 0
   for _, p in ipairs(W.clients[5].penalties) do if p.kind == 'GasCut' then cuts = cuts + 1 end end
-  check(cuts == 1 and noteOf(W.clients[5]):find('ALREADY ACTIVE', 1, true), 'a gas cut that is still running is not extended by the next violation (' .. cuts .. ' cut, note: ' .. noteOf(W.clients[5]) .. ')')
+  check(cuts == 1 and noteOf(W.clients[5]):find('ВЖЕ ДІЄ', 1, true), 'a gas cut that is still running is not extended by the next violation (' .. cuts .. ' cut, note: ' .. noteOf(W.clients[5]) .. ')')
 
   print('== penalty = off: warnings only')
   speeder({ penalty = 'off' })
   run(45)
-  check(#W.clients[5].penalties == 0 and noteOf(W.clients[5]):find('WARNING', 1, true), 'nothing is applied to the car, the driver is only warned')
+  check(#W.clients[5].penalties == 0 and noteOf(W.clients[5]):find('ПОПЕРЕДЖЕННЯ', 1, true), 'nothing is applied to the car, the driver is only warned')
 
   print('== penalty = slow: never more than a gas cut')
   speeder({ penalty = 'slow' })
@@ -905,7 +905,7 @@ local function scenarioPenalties()
   W.clients[1].chat('!yellow')
   b2[1].hold = 106 -- the leader keeps just under the limit and creeps past the pace car
   run(30)
-  check(kinds(W.clients[1]):sub(1, 6) == 'GasCut' and W.clients[1].messages[1]:find('Passed the pace car', 1, true), 'a gas cut at the very first violation: ' .. (W.clients[1].messages[1] or '-'))
+  check(kinds(W.clients[1]):sub(1, 6) == 'GasCut' and W.clients[1].messages[1]:find('Обгін пейс-кара', 1, true), 'a gas cut at the very first violation: ' .. (W.clients[1].messages[1] or '-'))
 
   print('== being pushed is no fault')
   speeder()
@@ -926,7 +926,7 @@ local function scenarioPenalties()
   speeder()
   W.penaltyFails = true
   run(45)
-  check(#W.errors == 0 and noteOf(W.clients[5]):find('NOT ENFORCED', 1, true), 'no script error, and the driver is told that it is not enforced')
+  check(#W.errors == 0 and noteOf(W.clients[5]):find('НЕ ЗАСТОСОВАНО', 1, true), 'no script error, and the driver is told that it is not enforced')
   W.penaltyFails = false
 
   print('== jumping the restart')
@@ -937,7 +937,7 @@ local function scenarioPenalties()
   b4[4].ignore = true
   run(20)
   local jumped = false
-  for _, m in ipairs(W.clients[4].messages) do jumped = jumped or m:find('Jumped the restart', 1, true) ~= nil end
+  for _, m in ipairs(W.clients[4].messages) do jumped = jumped or m:find('Фальстарт на рестарті', 1, true) ~= nil end
   check(jumped and not kinds(W.clients[4]):find('MandatoryPits', 1, true) and W.clients[4].oval.pen().owed == true, 'a warning for the speed, then a drive-through on the account for jumping the restart: ' .. table.concat(W.clients[4].messages, ' | '))
   W.clients[1].chat('!green')
   run(4)
@@ -961,13 +961,13 @@ local function scenarioLapped()
   run(1)
   local o = W.clients[1].oval.state().order
   check(table.concat(o, ',') == '1,2,3,4,5,6,7', 'the line is the race order, the lapped car last (' .. table.concat(o, ',') .. ')')
-  check(lc.oval.local1().place == 7 and lc.oval.info().why:find('7 OF 7', 1, true), 'the lapped driver is told his place: ' .. lc.oval.info().why)
-  check(W.clients[4].oval.info().title == 'FOLLOW car3', 'and the others whom to follow: ' .. W.clients[4].oval.info().title)
+  check(lc.oval.local1().place == 7 and lc.oval.info().why:find('7 З 7', 1, true), 'the lapped driver is told his place: ' .. lc.oval.info().why)
+  check(W.clients[4].oval.info().title == 'ЇДЬ ЗА car3', 'and the others whom to follow: ' .. W.clients[4].oval.info().title)
   local passSeen, letSeen = false, false
   for _ = 1, math.floor(30 / DT) do
     step()
-    passSeen = passSeen or shown(W.clients[4], 'PASS  car7')
-    letSeen = letSeen or shown(lc, 'LET car4 BY')
+    passSeen = passSeen or shown(W.clients[4], 'ОБЖЕНИ  car7')
+    letSeen = letSeen or shown(lc, 'ПРОПУСТИ car4')
   end
   check(passSeen and letSeen, 'car 4 is told to pass the lapped car, the lapped car to let it by')
   untilTrue(function() return W.clients[1].oval.state().phase == ONE_TO_GO end, 400, 'one to go')
@@ -1020,6 +1020,32 @@ local function scenarioNoScript()
   check(true, 'one to go and green happen too')
 end
 
+local function scenarioHud()
+  print('== the player drags the boxes (!hud)')
+  field(4, 45, 200, nil, 1)
+  run(2)
+  local cl = W.clients[2]
+  check(cl.chat('!hud') == true, '!hud is handled (kept out of chat)')
+  local ui = cl.env.ui
+  ui.mousePos = function() return { x = 960, y = 150 } end -- inside the top panel
+  ui.mouseClicked = function() return true end
+  ui.mouseDown = function() return true end
+  ui.mouseDelta = function() return { x = 19.2, y = 10.8 } end
+  run(0.5)
+  local hud = cl.oval.hud()
+  check(hud.topX > 0.52 and hud.topY > 50 / 1080 + 0.02 and hud.noteX == 0.5 and hud.debtY == 0.8,
+    string.format('the top panel follows the mouse, the other boxes stay (top %.3f %.3f)', hud.topX, hud.topY))
+  check(shown(cl, 'ПЕРЕТЯГНИ МИШЕЮ') and shown(cl, 'ЇДЬ ЗА Ivanov') and shown(cl, 'ПРОЇЗД ПІТ-ЛЕЙНУ ПІСЛЯ ЗЕЛЕНОГО ПРАПОРА'), 'the hint and a sample of every box are shown')
+  ui.mouseDown = function() return false end
+  local x = hud.topX
+  run(0.5)
+  check(hud.topX == x, 'released: the panel stays where it was put')
+  cl.chat('!hud')
+  ui.mousePos, ui.mouseClicked, ui.mouseDown, ui.mouseDelta = nil, nil, nil, nil
+  run(0.5)
+  check(not shown(cl, 'ПЕРЕТЯГНИ МИШЕЮ') and not shown(cl, 'ЇДЬ ЗА Ivanov'), '!hud again: the samples are gone')
+end
+
 scenarioManual()
 scenarioWreck()
 scenarioModel()
@@ -1037,5 +1063,6 @@ scenarioLapped()
 scenarioDomino()
 scenarioGiveUp()
 scenarioStraggler()
+scenarioHud()
 check(#W.errors == 0, 'no script errors' .. (W.errors[1] and (': ' .. W.errors[1]) or ''))
 print('all good')

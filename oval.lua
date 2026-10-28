@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 10.1'
+local VERSION = 'Oval 10.2'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -46,7 +46,12 @@ local cfg = okCfg and cfgRead or cfgDefaults
 
 local GREEN, CAUTION, ONE_TO_GO = 0, 1, 2
 local NONE, ORDER_MAX, STOP_KMH, RANK_DELAY = 255, 48, 25, 0.4
-local TITLES = { [0] = 'CAUTION', [1] = 'CAUTION - CAR STOPPED', [2] = 'ROLLING START', [3] = 'CAUTION - WRECK' }
+local TITLES = { [0] = 'ЖОВТИЙ ПРАПОР', [1] = 'ЖОВТИЙ ПРАПОР - МАШИНА СТОЇТЬ', [2] = 'РОЛІНГ-СТАРТ', [3] = 'ЖОВТИЙ ПРАПОР - АВАРІЯ' }
+local LAPPED = ' (ВІДСТАЄ НА КОЛО)'
+local function lapsWord(n) -- 1 коло, 2 кола, 5 кіл
+  local d, h = n % 10, n % 100
+  return d == 1 and h ~= 11 and 'КОЛО' or d >= 2 and d <= 4 and (h < 12 or h > 14) and 'КОЛА' or 'КІЛ'
+end
 
 local function try(what, fn, ...) -- a missing feature costs that feature, not the whole script
   local good, err = pcall(fn, ...)
@@ -274,21 +279,21 @@ end
 local function penalize(why, weight)
   if uiTime - (pen.last[why] or -100) < cfg.strikeGapSec then return end -- the same offence at most once per gap
   pen.last[why], pen.strikes = uiTime, pen.strikes + weight
-  local level, title, applied = pen.strikes, 'WARNING', true
+  local level, title, applied = pen.strikes, 'ПОПЕРЕДЖЕННЯ', true
   if cfg.penalty ~= 'off' and level >= 2 then
     if cfg.penalty == 'drive' and level >= 3 and not pen.owed and not pen.driving then
       -- Handed out only when the race is green again: a caution is over in about a lap, too soon
       -- to serve it. Verified in the game: it is served by a run through the pit lane.
-      title, pen.owed = 'DRIVE-THROUGH AFTER THE GREEN', true
+      title, pen.owed = 'ПРОЇЗД ПІТ-ЛЕЙНУ ПІСЛЯ ЗЕЛЕНОГО', true
     elseif uiTime - (pen.slowAt or -100) < cfg.slowSec + 3 then
-      title = 'GAS CUT (ALREADY ACTIVE)' -- a running gas cut is not extended
+      title = 'ВІДСІЧКА ГАЗУ (ВЖЕ ДІЄ)' -- a running gas cut is not extended
     else
-      title = 'GAS CUT ' .. cfg.slowSec .. ' S'
+      title = 'ВІДСІЧКА ГАЗУ ' .. cfg.slowSec .. ' С'
       applied = cutGas(cfg.slowSec)
       if applied then pen.slowAt = uiTime end
     end
   end
-  if not applied then title = title .. ' (NOT ENFORCED)' end
+  if not applied then title = title .. ' (НЕ ЗАСТОСОВАНО)' end
   penNote = { title = title, why = why, untilT = uiTime + 7 }
   pcall(ac.setMessage, title, why, 'illegal', 7)
   ac.log(string.format('Oval: %s - %s (strikes %d)', title, why, level))
@@ -303,12 +308,12 @@ local function judge(dt)
   L1.passT = L1.passing and not free and (L1.passT or 0) + dt or 0
   if L1.speedT >= cfg.speedSec then
     L1.speedT = 0
-    penalize(S.phase == ONE_TO_GO and 'Too fast before the green flag' or 'Speeding behind the pace car', 1)
+    penalize(S.phase == ONE_TO_GO and 'Завелика швидкість перед зеленим прапором' or 'Перевищення швидкості за пейс-каром', 1)
   end
   if L1.passT >= cfg.passSec then
     L1.passT = 0
     local pace, restart = L1.key == 'pace', S.phase == ONE_TO_GO
-    penalize(pace and 'Passed the pace car' or restart and 'Jumped the restart' or 'Passed under caution', (pace or restart) and 2 or 1)
+    penalize(pace and 'Обгін пейс-кара' or restart and 'Фальстарт на рестарті' or 'Обгін під жовтим прапором', (pace or restart) and 2 or 1)
   end
 end
 
@@ -318,9 +323,9 @@ local function handOutOwed()
   pen.owed = false
   local applied = setPenalty('MandatoryPits', cfg.driveLaps)
   if applied then pen.driving, pen.pitSeen = true, false end
-  local title = 'DRIVE-THROUGH PENALTY' .. (applied and '' or ' (NOT ENFORCED)')
-  penNote = { title = title, why = 'Enter the pit lane now', untilT = uiTime + 7 }
-  pcall(ac.setMessage, title, 'Enter the pit lane now', 'illegal', 7)
+  local title = 'ШТРАФ: ПРОЇЗД ПІТ-ЛЕЙНУ' .. (applied and '' or ' (НЕ ЗАСТОСОВАНО)')
+  penNote = { title = title, why = 'Заїжджай на піт-лейн зараз', untilT = uiTime + 7 }
+  pcall(ac.setMessage, title, penNote.why, 'illegal', 7)
   local me = ac.getCar(0)
   ac.log(string.format('Oval: %s handed out after the green flag (lap %s, track position %.3f)', title, tostring(me.lapCount), me.splinePosition))
 end
@@ -345,7 +350,7 @@ local function watchGamePenalty(me)
   if pen.driving and black and kind == black then
     pen.driving = false
     local applied = setPenalty('ReleaseBlackFlag')
-    penNote = { title = 'BLACK FLAG RELEASED', why = 'Drive-through not served', untilT = uiTime + 7 }
+    penNote = { title = 'ЧОРНИЙ ПРАПОР ЗНЯТО', why = 'Проїзд піт-лейну не відбуто', untilT = uiTime + 7 }
     pcall(ac.setMessage, penNote.title, penNote.why, 'illegal', 7)
     ac.log('Oval: black flag after a drive-through, released (applied=' .. tostring(applied) .. ')')
   end
@@ -431,8 +436,8 @@ local function localCheck(cars, dt)
   L1.down, L1.refDown = lapsDown(me, cars), ref and lapsDown(ref, cars) or 0
   if key ~= followKey then -- say it loud whenever the car to follow changes
     followKey = key
-    local name = ref and ac.getDriverName(ref.index) .. (L1.refDown > 0 and ' (LAPPED)' or '')
-    infoNote = { title = name and 'FOLLOW ' .. name or leaderGo and 'YOU LEAD THE FIELD' or 'FOLLOW THE PACE CAR', why = string.format('YOUR PLACE IN THE LINE: %d OF %d', idx, #S.order), untilT = uiTime + 6 }
+    local name = ref and ac.getDriverName(ref.index) .. (L1.refDown > 0 and LAPPED or '')
+    infoNote = { title = name and 'ЇДЬ ЗА ' .. name or leaderGo and 'ТИ ВЕДЕШ КОЛОНУ' or 'ЇДЬ ЗА ПЕЙС-КАРОМ', why = string.format('ТВОЄ МІСЦЕ В КОЛОНІ: %d З %d', idx, #S.order), place = idx, count = #S.order, untilT = uiTime + 6 }
   end
   judge(dt)
 end
@@ -605,10 +610,12 @@ local function reset()
 end
 try('session start events', ac.onSessionStart, reset)
 
--- Chat commands: !ovaldebug (anyone, only for yourself), !yellow / !green (admin)
+-- Chat commands: !ovaldebug and !hud (anyone, only for yourself), !yellow / !green (admin)
+local hudEdit = false -- the boxes can be dragged with the mouse
 local function command(msg)
   local cmd = msg:lower():match('^%s*!(%a+)%s*$')
   if cmd == 'ovaldebug' then debugOn = not debugOn return true end
+  if cmd == 'hud' then hudEdit = not hudEdit return true end
   if (cmd ~= 'yellow' and cmd ~= 'green') or not isActive() then return false end
   if sim.isOnlineRace and not sim.isAdmin then return false end
   if cmd == 'yellow' then deploy(0, NONE) else release() end
@@ -807,14 +814,14 @@ local function drawPaceCar()
   local f = car3d.frame
   if f and car3d.state ~= 'ready' then -- no model: an arrow and a label
     render.debugArrow(f.p + vec3(0, 14, 0), f.p + vec3(0, 2, 0), 1.5, YELLOW)
-    render.debugText(f.p + vec3(0, 16, 0), 'PACE CAR', YELLOW, 2)
+    render.debugText(f.p + vec3(0, 16, 0), 'ПЕЙС-КАР', YELLOW, 2)
   elseif f then
-    render.debugText(f.p + f.up * 3.6, 'PACE CAR', YELLOW, 1.5)
+    render.debugText(f.p + f.up * 3.6, 'ПЕЙС-КАР', YELLOW, 1.5)
   end
   if car3d.inPits and S.phase == CAUTION then -- the leader follows its point on the road while it is still in the pits
     local q = ac.trackCoordinateToWorld(vec3(0, 0, pacePos()))
     render.debugArrow(q + vec3(0, 14, 0), q + vec3(0, 2, 0), 1.5, YELLOW)
-    render.debugText(q + vec3(0, 16, 0), 'PACE CAR LEAVING THE PITS', YELLOW, 2)
+    render.debugText(q + vec3(0, 16, 0), 'ПЕЙС-КАР ВИЇЖДЖАЄ З БОКСІВ', YELLOW, 2)
   end
 end
 
@@ -875,95 +882,204 @@ local function drawDebug()
     stats.sent, stats.got, stats.stale, table.concat(ids, ',')), 13, vec2(12, 74), yel)
 end
 
+-- Where the boxes stand (share of the screen: middle of a box, its top). The player drags them with the mouse
+-- after !hud or from the online extras of the chat app; ac.storage keeps them on his PC.
+local HUD_DEFAULT = { topX = 0.5, topY = 50 / 1080, noteX = 0.5, noteY = 0.3, debtX = 0.5, debtY = 0.8 }
+local okHud, hud = pcall(ac.storage, HUD_DEFAULT, 'ovalHud.')
+if not okHud or type(hud) ~= 'table' then hud = {}; for key, v in pairs(HUD_DEFAULT) do hud[key] = v end end
+local toolSeen, drag, boxes = -100, nil, {}
+try('online extras', function()
+  ui.registerOnlineExtra(ui.Icons.Settings, 'Плашки овалу', nil, function()
+    toolSeen = uiTime
+    ui.text('Перетягни плашки мишею.')
+    if ui.button('Скинути') then for key, v in pairs(HUD_DEFAULT) do hud[key] = v end end
+  end, nil, ui.OnlineExtraFlags.Tool)
+end)
+local function editing() return hudEdit or uiTime - toolSeen < 0.5 end
+
+-- a box that can be dragged: where it is this frame, and a frame around it while the player arranges them
+local function box(key, x1, y1, x2, y2, edit)
+  boxes[key] = { x1, y1, x2, y2 }
+  if edit then ui.drawRect(vec2(x1 - 4, y1 - 4), vec2(x2 + 4, y2 + 4), rgbm(1, 1, 1, 1), 12, nil, 3) end
+end
+
+local function dragBoxes(win)
+  local m = ui.mousePos()
+  if ui.mouseClicked(0) then
+    drag = nil
+    for key, b in pairs(boxes) do if m.x >= b[1] and m.x <= b[3] and m.y >= b[2] and m.y <= b[4] then drag = key end end
+  end
+  if not ui.mouseDown(0) then drag = nil end
+  if drag then
+    local d = ui.mouseDelta()
+    hud[drag .. 'X'] = clamp(hud[drag .. 'X'] + d.x / win.x, 0, 1)
+    hud[drag .. 'Y'] = clamp(hud[drag .. 'Y'] + d.y / win.y, 0, 0.95)
+  end
+  ui.dwriteDrawText('ПЛАШКИ: ПЕРЕТЯГНИ МИШЕЮ.  ГОТОВО: !hud АБО ЗАКРИЙ ВІКНО', 20, vec2(12, win.y - 44), rgbm(1, 1, 1, 1))
+end
+
+-- A line is a list of parts { text, size[, color] } side by side: the numbers and the names that matter are bigger.
+local function widthOf(parts, k)
+  local w = 0
+  for _, p in ipairs(parts) do w = w + ui.measureDWriteText(p[1], p[2] * k).x end
+  return w
+end
+
+-- half the width of a box: at least `min`, wider when a line needs it (a Ukrainian line or a long name never sticks out)
+local function halfW(k, min, list)
+  local w = min * k
+  for _, parts in ipairs(list) do w = math.max(w, widthOf(parts, k) + 40 * k) end
+  return w / 2
+end
+
+local function lineHeight(parts)
+  local top = 0
+  for _, p in ipairs(parts) do top = math.max(top, p[2]) end
+  return top
+end
+
+-- draws a line centred on cx, the bottoms of the parts in line
+local function rich(parts, k, cx, y, color)
+  local x, top = cx - widthOf(parts, k) / 2, lineHeight(parts)
+  for _, p in ipairs(parts) do
+    ui.dwriteDrawText(p[1], p[2] * k, vec2(x, y + (top - p[2]) * k * 0.8), p[3] or color)
+    x = x + ui.measureDWriteText(p[1], p[2] * k).x
+  end
+end
+
+local DEMO_NOTE = { title = 'ЇДЬ ЗА Ivanov', place = 3, count = 8 }
+
 function script.drawUI()
   guard(function()
     local win = ui.windowSize()
-    if uiTime < 20 then ui.dwriteDrawText(string.format('%s loaded (CSP %s)', VERSION, tostring(build)), 14, vec2(12, 8), rgbm(1, 1, 1, 0.8)) end
+    local edit = editing()
+    if edit then dragBoxes(win) end
+    boxes = {}
+    if uiTime < 20 then ui.dwriteDrawText(string.format('%s завантажено (CSP %s)', VERSION, tostring(build)), 14, vec2(12, 8), rgbm(1, 1, 1, 0.8)) end
     if lastError then
-      ui.dwriteDrawText(('OVAL error: ' .. tostring(lastError)):sub(1, 200), 14, vec2(12, 48), rgbm(1, 0.3, 0.3, 1))
+      ui.dwriteDrawText(('OVAL помилка: ' .. tostring(lastError)):sub(1, 200), 14, vec2(12, 48), rgbm(1, 0.3, 0.3, 1))
     end
     if not sendEvent and isActive() then
-      ui.dwriteDrawText('OVAL: no online events, the flag will not reach you. Update Custom Shaders Patch.', 16, vec2(12, 30), rgbm(1, 0.3, 0.3, 1))
+      ui.dwriteDrawText('OVAL: немає online events, прапор до тебе не дійде. Онови Custom Shaders Patch.', 16, vec2(12, 30), rgbm(1, 0.3, 0.3, 1))
     end
     if debugOn then drawDebug() end
-    if not isActive() then return end
-    if penNote and uiTime < penNote.untilT then
-      local k0, w, h = win.y / 1080, 640, 130
-      local x0, y0 = win.x / 2 - w * k0 / 2, win.y * 0.3
-      ui.drawRectFilled(vec2(x0, y0), vec2(x0 + w * k0, y0 + h * k0), RED, 12 * k0)
-      centered(penNote.title, 40 * k0, win.x / 2, y0 + 12 * k0, rgbm(1, 1, 1, 1))
-      centered(penNote.why, 22 * k0, win.x / 2, y0 + 78 * k0, rgbm(1, 1, 0.7, 1))
+    if not isActive() and not edit then return end
+    local k = win.y / 1080
+    local pn = penNote and uiTime < penNote.untilT and penNote or nil
+    local info = not pn and infoNote and uiTime < infoNote.untilT and infoNote or nil
+    if edit and not pn and not info then info = DEMO_NOTE end
+    local cx, y0 = hud.noteX * win.x, hud.noteY * win.y
+    if pn then
+      local hw = halfW(k, 640, { { { pn.title, 40 } }, { { pn.why, 22 } } })
+      ui.drawRectFilled(vec2(cx - hw, y0), vec2(cx + hw, y0 + 130 * k), RED, 12 * k)
+      box('note', cx - hw, y0, cx + hw, y0 + 130 * k, edit)
+      centered(pn.title, 40 * k, cx, y0 + 12 * k, rgbm(1, 1, 1, 1))
+      centered(pn.why, 22 * k, cx, y0 + 78 * k, rgbm(1, 1, 0.7, 1))
+    elseif info then -- whom to follow, in big letters
+      local why = info.place and { { 'ТВОЄ МІСЦЕ В КОЛОНІ:  ', 22 }, { tostring(info.place), 40 }, { '  З ' .. info.count, 22 } } or { { info.why, 22 } }
+      local hw = halfW(k, 640, { { { info.title, 36 } }, why })
+      ui.drawRectFilled(vec2(cx - hw, y0), vec2(cx + hw, y0 + 112 * k), YELLOW, 12 * k)
+      box('note', cx - hw, y0, cx + hw, y0 + 112 * k, edit)
+      centered(info.title, 36 * k, cx, y0 + 8 * k, BLACK)
+      rich(why, k, cx, y0 + 56 * k, BLACK)
     end
-    local debt = pen.driving and 'DRIVE-THROUGH: ENTER THE PIT LANE' or pen.owed and 'DRIVE-THROUGH DUE AFTER THE GREEN FLAG'
+    local debt = pen.driving and 'ПРОЇЗД ПІТ-ЛЕЙНУ: ЗАЇЖДЖАЙ НА ПІТ-ЛЕЙН' or pen.owed and 'ПРОЇЗД ПІТ-ЛЕЙНУ ПІСЛЯ ЗЕЛЕНОГО ПРАПОРА'
+      or edit and 'ПРОЇЗД ПІТ-ЛЕЙНУ ПІСЛЯ ЗЕЛЕНОГО ПРАПОРА'
     if debt then
-      local k1 = win.y / 1080
-      ui.drawRectFilled(vec2(win.x / 2 - 300 * k1, win.y * 0.8), vec2(win.x / 2 + 300 * k1, win.y * 0.8 + 44 * k1), RED, 10 * k1)
-      centered(debt, 22 * k1, win.x / 2, win.y * 0.8 + 8 * k1, rgbm(1, 1, 1, 1))
-    end
-    local k, cx = win.y / 1080, win.x / 2
-    if infoNote and uiTime < infoNote.untilT and not (penNote and uiTime < penNote.untilT) then -- whom to follow, in big letters
-      local y0 = win.y * 0.3
-      ui.drawRectFilled(vec2(cx - 320 * k, y0), vec2(cx + 320 * k, y0 + 100 * k), YELLOW, 12 * k)
-      centered(infoNote.title, 36 * k, cx, y0 + 10 * k, BLACK)
-      centered(infoNote.why, 22 * k, cx, y0 + 62 * k, BLACK)
+      local dx, dy = hud.debtX * win.x, hud.debtY * win.y
+      local hw = halfW(k, 600, { { { debt, 22 } } })
+      ui.drawRectFilled(vec2(dx - hw, dy), vec2(dx + hw, dy + 44 * k), RED, 10 * k)
+      box('debt', dx - hw, dy, dx + hw, dy + 44 * k, edit)
+      centered(debt, 22 * k, dx, dy + 8 * k, rgbm(1, 1, 1, 1))
     end
     local showGreen = S.phase == GREEN and S.seq > 0 and clock() - S.tStart < 5000
-    if S.phase == GREEN and not showGreen then return end
+    local demo = edit and (not isActive() or S.phase == GREEN and not showGreen)
+    if S.phase == GREEN and not showGreen and not demo then return end
 
-    local y = 50 * k
-    local title, bg, lines = 'GREEN FLAG', GREENC, {}
-    if S.phase == ONE_TO_GO then
-      title, bg, lines[1] = 'ONE TO GO', YELLOW, 'GREEN AT THE START/FINISH LINE'
+    cx = hud.topX * win.x
+    local y = hud.topY * win.y
+    local title, bg, lines = 'ЗЕЛЕНИЙ ПРАПОР', GREENC, {}
+    local function add(text) lines[#lines + 1] = { { text, 18 } } end
+    if demo then
+      title, bg, showGreen = TITLES[0], YELLOW, false
+      lines = { { { 'МІСЦЕ  ', 18 }, { '3', 30 }, { '  З 8 У КОЛОНІ', 18 } }, { { 'ЇДЬ ЗА  ', 18 }, { 'Ivanov', 26 } } }
+    elseif S.phase == ONE_TO_GO then
+      title, bg = 'ОДНЕ КОЛО ДО ЗЕЛЕНОГО', YELLOW
+      add('ЗЕЛЕНИЙ НА ЛІНІЇ СТАРТ/ФІНІШ')
     elseif S.phase == CAUTION then
-      title, bg = TITLES[S.reason] or 'CAUTION', YELLOW
+      title, bg = TITLES[S.reason] or TITLES[0], YELLOW
       local who = hudCars[S.cause]
-      lines[1] = S.reason == 2 and 'HOLD YOUR ROW - GREEN AT THE LINE' or who and ac.getDriverName(who.index) or nil
-      if car3d.inPits then lines[#lines + 1] = 'PACE CAR LEAVING THE PITS - HOLD THE PACE' end
+      if S.reason == 2 then add('ТРИМАЙ СВІЙ РЯД - ЗЕЛЕНИЙ НА ЛІНІЇ') elseif who then add(ac.getDriverName(who.index)) end
+      if car3d.inPits then add('ПЕЙС-КАР ВИЇЖДЖАЄ З БОКСІВ - ТРИМАЙ ТЕМП') end
     end
-    if not showGreen then
+    if not showGreen and not demo then
       if L1.out then
-        lines[#lines + 1] = 'OUT OF THE LINE: GET BACK UP TO SPEED'
+        add('ТИ ПОЗА КОЛОНОЮ: НАБЕРИ ШВИДКІСТЬ')
       elseif L1.place then
-        local place = string.format('PLACE %d OF %d IN THE LINE', L1.place, L1.count)
-        if S.reason == 2 then place = string.format('ROW %d   ', math.ceil(L1.place / 2)) .. place end
+        local place = {}
+        if S.reason == 2 then place = { { 'РЯД  ', 18 }, { tostring(math.ceil(L1.place / 2)), 30 }, { '     ', 18 } } end
+        place[#place + 1] = { 'МІСЦЕ  ', 18 }
+        place[#place + 1] = { tostring(L1.place), 30 }
+        place[#place + 1] = { '  З ' .. L1.count .. ' У КОЛОНІ', 18 }
         if S.phase == CAUTION then
           local crossed, at = greenLine()
-          place = place .. string.format('     GREEN IN %d LAP%s', at - crossed, at - crossed == 1 and '' or 'S')
+          place[#place + 1] = { '     ЗЕЛЕНИЙ ЧЕРЕЗ  ', 18 }
+          place[#place + 1] = { tostring(at - crossed), 30 }
+          place[#place + 1] = { '  ' .. lapsWord(at - crossed), 18 }
         end
         lines[#lines + 1] = place
-        lines[#lines + 1] = L1.ref and (L1.beside and 'BESIDE  ' or 'FOLLOW  ') .. ac.getDriverName(L1.ref.index) .. (L1.refDown > 0 and '  (LAPPED)' or '')
-          or S.phase == ONE_TO_GO and 'YOU LEAD: HOLD THE PACE, GO AT THE LINE' or 'FOLLOW THE PACE CAR'
-        if L1.passIt then lines[#lines + 1] = 'PASS  ' .. ac.getDriverName(L1.passIt.index) .. (L1.passIt.speedKmh < offPaceKmh() and '  (TOO SLOW)' or '  (BEHIND YOU IN THE LINE)') end
+        if L1.ref then
+          lines[#lines + 1] = { { L1.beside and 'ПОРУЧ З  ' or 'ЇДЬ ЗА  ', 18 }, { ac.getDriverName(L1.ref.index), 26 }, { L1.refDown > 0 and LAPPED or '', 18 } }
+        else
+          add(S.phase == ONE_TO_GO and 'ТИ ЛІДЕР: ТРИМАЙ ТЕМП, ГАЗ НА ЛІНІЇ' or 'ЇДЬ ЗА ПЕЙС-КАРОМ')
+        end
+        if L1.passIt then add('ОБЖЕНИ  ' .. ac.getDriverName(L1.passIt.index) .. (L1.passIt.speedKmh < offPaceKmh() and '  (ЗАНАДТО ПОВІЛЬНИЙ)' or '  (ПОЗАДУ ТЕБЕ В КОЛОНІ)')) end
       end
     end
-    local bar = not showGreen and L1.target ~= nil
-    local h = 44 + #lines * 24 + (bar and 58 or 0)
-    ui.drawRectFilled(vec2(cx - 320 * k, y), vec2(cx + 320 * k, y + h * k), bg, 10 * k)
-    centered(title, 30 * k, cx, y + 6 * k, BLACK)
-    if showGreen then return end
-
-    local yy = y + 44 * k
-    for _, line in ipairs(lines) do centered(line, 18 * k, cx, yy, BLACK); yy = yy + 24 * k end
-    if bar then -- where we are against our place: the marker right of the middle = ahead of it
-      local half, err = 200 * k, L1.err
-      local mx = cx + clamp(-err, -60, 60) / 60 * half
-      ui.drawRectFilled(vec2(cx - half, yy + 2 * k), vec2(cx + half, yy + 14 * k), rgbm(0, 0, 0, 0.6), 4 * k)
-      ui.drawRectFilled(vec2(cx - half / 6, yy + 2 * k), vec2(cx + half / 6, yy + 14 * k), GREENC, 4 * k) -- +-10 m
-      ui.drawRectFilled(vec2(mx - 4 * k, yy - 2 * k), vec2(mx + 4 * k, yy + 18 * k), math.abs(err) <= 10 and BLACK or RED, 2 * k)
-      local say = err > 10 and string.format('SPEED UP  %d m', math.floor(err + 0.5)) or err < -10 and string.format('BACK OFF  %d m', math.floor(-err + 0.5)) or 'IN POSITION'
-      centered(string.format('%s     %d / %d km/h%s', say, math.floor(ac.getCar(0).speedKmh), math.floor(L1.target + 0.5), L1.limiting and '  LIMITER' or ''),
-        20 * k, cx, yy + 24 * k, (L1.speeding or L1.passing) and RED or BLACK)
+    local bar = not showGreen and not demo and L1.target ~= nil
+    local barLine
+    if bar then
+      local err = L1.err
+      barLine = err > 10 and { { 'ДОДАЙ  ', 20 }, { math.floor(err + 0.5) .. ' м', 32 } } or err < -10 and { { 'СКИНЬ  ', 20 }, { math.floor(-err + 0.5) .. ' м', 32 } } or { { 'НА МІСЦІ', 20 } }
+      barLine[#barLine + 1] = { '      ', 20 }
+      barLine[#barLine + 1] = { tostring(math.floor(ac.getCar(0).speedKmh)), 32 }
+      barLine[#barLine + 1] = { ' / ' .. math.floor(L1.target + 0.5) .. ' км/год' .. (L1.limiting and '  ОБМЕЖУВАЧ' or ''), 20 }
     end
     local warn, wbg = nil, RED
-    if L1.passing then warn = 'DO NOT PASS - DROP BACK'
-    elseif L1.letIt then warn, wbg = 'LET ' .. ac.getDriverName(L1.letIt.index) .. ' BY - AHEAD OF YOU IN THE LINE', BLUE
-    elseif L1.tooClose then warn = 'TOO CLOSE - BACK OFF'
-    elseif L1.speeding then warn = 'SLOW DOWN'
-    elseif L1.lagging then warn = 'SPEED UP - CLOSE THE GAP' end
-    if warn then
-      ui.drawRectFilled(vec2(cx - 320 * k, y + (h + 6) * k), vec2(cx + 320 * k, y + (h + 46) * k), wbg, 10 * k)
-      centered(warn, 24 * k, cx, y + (h + 12) * k, rgbm(1, 1, 1, 1))
+    if L1.passing then warn = 'НЕ ОБГАНЯЙ - ПОВЕРНИСЬ НАЗАД'
+    elseif L1.letIt then warn, wbg = 'ПРОПУСТИ ' .. ac.getDriverName(L1.letIt.index) .. ' - ВІН ПОПЕРЕДУ ТЕБЕ В КОЛОНІ', BLUE
+    elseif L1.tooClose then warn = 'ЗАБЛИЗЬКО - ЗБІЛЬШ ДИСТАНЦІЮ'
+    elseif L1.speeding then warn = 'ЗБАВ ШВИДКІСТЬ'
+    elseif L1.lagging then warn = 'ДОДАЙ - СКОРОТИ ВІДСТАНЬ' end
+    if showGreen or demo then warn = nil end
+
+    local sized = { { { title, 30 } } }
+    local h = 44
+    for _, line in ipairs(lines) do sized[#sized + 1] = line; h = h + lineHeight(line) + 6 end
+    if barLine then sized[#sized + 1] = barLine; h = h + 24 + lineHeight(barLine) + 8 end
+    if warn then sized[#sized + 1] = { { warn, 24 } } end
+    local hw = halfW(k, 640, sized)
+    ui.drawRectFilled(vec2(cx - hw, y), vec2(cx + hw, y + h * k), bg, 10 * k)
+    centered(title, 30 * k, cx, y + 6 * k, BLACK)
+    if not showGreen then
+      local yy = y + 44 * k
+      for _, line in ipairs(lines) do rich(line, k, cx, yy, BLACK); yy = yy + (lineHeight(line) + 6) * k end
+      if bar then -- where we are against our place: the marker right of the middle = ahead of it
+        local half, err = 200 * k, L1.err
+        local mx = cx + clamp(-err, -60, 60) / 60 * half
+        ui.drawRectFilled(vec2(cx - half, yy + 2 * k), vec2(cx + half, yy + 14 * k), rgbm(0, 0, 0, 0.6), 4 * k)
+        ui.drawRectFilled(vec2(cx - half / 6, yy + 2 * k), vec2(cx + half / 6, yy + 14 * k), GREENC, 4 * k) -- +-10 m
+        ui.drawRectFilled(vec2(mx - 4 * k, yy - 2 * k), vec2(mx + 4 * k, yy + 18 * k), math.abs(err) <= 10 and BLACK or RED, 2 * k)
+        rich(barLine, k, cx, yy + 22 * k, (L1.speeding or L1.passing) and RED or BLACK)
+      end
     end
+    local bottom = y + h * k
+    if warn then
+      ui.drawRectFilled(vec2(cx - hw, bottom + 6 * k), vec2(cx + hw, bottom + 46 * k), wbg, 10 * k)
+      centered(warn, 24 * k, cx, bottom + 12 * k, rgbm(1, 1, 1, 1))
+      bottom = bottom + 46 * k
+    end
+    box('top', cx - hw, y, cx + hw, bottom, edit)
   end)()
 end
 
@@ -976,4 +1092,4 @@ pcall(function() ac.log(string.format('Oval: %s loaded, CSP %s, me=%d cars=%d ra
 pcall(function() local s = ac.getSession(sim.currentSessionIndex); ac.log(string.format('Oval: session laps=%s timed=%s minutes=%s', tostring(s.laps), tostring(s.isTimedRace), tostring(s.durationMinutes))) end)
 
 -- Offline tests load this file with a fake `ac` and read the internals from here.
-if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, pen = function() return pen end, note = function() return penNote end, info = function() return infoNote end, stats = function() return stats end } end
+if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, pen = function() return pen end, note = function() return penNote end, info = function() return infoNote end, stats = function() return stats end, hud = function() return hud end } end
