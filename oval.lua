@@ -7,7 +7,7 @@ local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
 local cfgDefaults = {
-  paceKmh = 100,       -- pace car speed
+  paceKmh = 140,       -- pace car speed (100 made a caution on a 4 km oval last 5.5..8 minutes)
   speedTolKmh = 8,     -- speed above the target that still counts as fine
   catchupKmh = 60,     -- extra speed allowed while closing a big gap to your place in the line
   gapSec = 0.6,        -- gap between two places in the line at the pace speed, seconds (the leader keeps it to the pace car)

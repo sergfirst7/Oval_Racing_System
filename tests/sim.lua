@@ -10,7 +10,7 @@ local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
 local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {}, logs = {}, oldApi = {} } -- t in seconds
-local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray, W.penaltyFails, W.pitLane = 0, {}, {}, {}, 60, false, { rolling = 0 }, true, 0, false, 'ok', false, nil end
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray, W.penaltyFails, W.pitLane = 0, {}, {}, {}, 60, false, { rolling = 0, paceKmh = 100 }, true, 0, false, 'ok', false, nil end
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
 local V = {}
