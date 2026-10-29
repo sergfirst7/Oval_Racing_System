@@ -570,6 +570,17 @@ local function scenarioWreck()
   untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 15, 'the caution for the spun car')
   check(W.clients[1].oval.state().cause == 3 and W.t - t2 > 2, 'no caution at the spin itself, but once it stands on the road (' .. string.format('%.1f', W.t - t2) .. ' s)')
 
+  print('== a crash on its own, then a hit by another car')
+  byId = field(8, 45, 250)
+  run(30)
+  W.clients[5].hitcb(0); byId[5].speedKmh, byId[5].cruise = 150, 150 -- off the wall on its own, goes on
+  run(2)
+  everyone(GREEN, 'the crash on its own calls no caution')
+  W.clients[5].hitcb(6); byId[5].speedKmh = 80 -- and now car 6 runs into it
+  t2 = W.t
+  untilTrue(function() return W.clients[1].oval.state().phase == CAUTION end, 3, 'the caution for the hit')
+  check(W.clients[1].oval.state().reason == 3 and W.clients[1].oval.state().cause == 5, 'the hit by a car right after it counts at once (' .. string.format('%.1f', W.t - t2) .. ' s)')
+
   print('== a limping car')
   byId = field(8, 45, 250)
   run(30)
@@ -1118,8 +1129,10 @@ local function scenarioWave()
   local cl = W.clients[1]
   check(W.clients[7].oval.dep().me.wave == nil, 'nobody goes round while the pit lane is closed')
   untilTrue(function() return cl.oval.pitWindow() == 1 end, 200, 'the pit lane open for the lead lap')
-  run(0.5)
-  check(W.clients[7].oval.dep().me.wave == 'LUCKY DOG' and shown(W.clients[7], 'LUCKY DOG'), 'the first lapped car is the lucky dog as soon as the pit lane opens, and is told so')
+  run(2)
+  check(W.clients[7].oval.dep().me.wave == nil, 'not while the line is still at the pit entry (cars turn in there)')
+  untilTrue(function() return W.clients[7].oval.dep().me.wave ~= nil end, 30, 'the lucky dog')
+  check(W.clients[7].oval.dep().me.wave == 'LUCKY DOG' and shown(W.clients[7], 'LUCKY DOG'), 'the first lapped car is the lucky dog once the line has passed the pit entry, and is told so')
   check(W.clients[8].oval.dep().me.wave == nil and W.clients[6].oval.dep().me.wave == nil, 'the other lapped car waits for the leader, a car on the lead lap never goes')
   byId[1].isInPitlane = true -- the leader pits, car 8 stays out
   run(1)

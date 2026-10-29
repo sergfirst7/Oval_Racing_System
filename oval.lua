@@ -208,12 +208,16 @@ end
 -- one of a rolling start; under a caution the one after 1.5..2.5 laps (cautionLaps = 2), but never before
 -- the pit cycle is through: the last lap begins after the pit lane has opened for everybody (pitWindow)
 local pit, goAt -- the pit lane, read from the track (below)
+-- where the pace car passes the pit entry for the k-th time (in laps, like paceRun): the first pass counts
+-- a quarter of a lap after it appeared at the earliest
+local function pitPass(k)
+  local e, first = pit and pit.inS or goAt(), S.s0 + 0.25
+  return first + frac(e - first) + k - 1
+end
 local function greenLine()
   local crossed = math.floor(paceRun())
   if S.reason == 2 then return crossed, math.max(1, math.ceil(S.s0 + cfg.formationLaps - 0.5)) end
-  local e, first = pit and pit.inS or goAt(), S.s0 + 0.25
-  local everybody = first + frac(e - first) + 1 -- the pace car's second counted pass of the pit entry
-  return crossed, math.max(1, math.ceil(S.s0 + cfg.cautionLaps - 0.5), math.ceil(everybody) + 1)
+  return crossed, math.max(1, math.ceil(S.s0 + cfg.cautionLaps - 0.5), math.ceil(pitPass(2)) + 1)
 end
 
 -- ── the pit lane ─────────────────────────────────────────────────────────────
@@ -427,8 +431,8 @@ end
 -- after it appeared at the earliest), then open for the cars on the lead lap, from its next pass for everybody.
 local function pitWindow() -- 0 closed, 1 lead lap only, 2 open
   if S.phase ~= CAUTION or S.reason == 2 then return 2 end
-  local e = pit and pit.inS or goAt()
-  return clamp(math.floor(paceRun() - e) - math.floor(S.s0 + 0.25 - e), 0, 2)
+  local run = paceRun()
+  return run >= pitPass(2) and 2 or run >= pitPass(1) and 1 or 0
 end
 
 local function lapsDown(c, cars)
@@ -542,6 +546,8 @@ local function watchWave(me, cars)
     if mine and mine.kind == WAVE then flagMe(0) end -- a closed pit lane (TAIL, just set) stays as it is
   end
   if m.wave or m.off or me.isInPitlane or finalLap() or pitWindow() < 1 then return end
+  -- not into the cars that are turning into the pit lane: only once the whole line has passed the pit entry
+  if (paceRun() - pitPass(1)) * trackLen() < #S.order * gapM() + 150 then return end
   local down = lapsDown(me, cars)
   if down < 1 then return end
   if m.luckyJudged == nil then -- once, when the pit lane opens: the line is the race order, a lapped car ahead of me is the lucky dog
@@ -635,7 +641,8 @@ local function watchSelf(dt, now)
   local hit = watch.hit
   if hit and uiTime - hit.t > 2.5 then hit = nil; watch.hit = nil end
   local recent = hit and uiTime - hit.t < 1
-  if not watch.solo and (lost(0.4) >= cfg.wreckDropKmh or (recent and lost(1) >= 35) or (hit and speed < hit.peak * 0.35)) then
+  local armed = not watch.solo or (watch.carHit or -100) > watch.solo -- after a crash on its own, a hit by a car counts again
+  if armed and (lost(0.4) >= cfg.wreckDropKmh or (recent and lost(1) >= 35) or (hit and speed < hit.peak * 0.35)) then
     local withCar = uiTime - (watch.carHit or -100) < 3
     ac.log(string.format('Oval: wreck, speed=%d lost=%d contact=%s with a car=%s', math.floor(speed), math.floor(lost(1)), tostring(hit ~= nil), tostring(withCar)))
     if withCar then return deploy(3, me.sessionID) end
