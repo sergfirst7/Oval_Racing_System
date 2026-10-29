@@ -1164,6 +1164,8 @@ local function scenarioWave()
   check(W.clients[7].oval.dep().me.wave == nil, 'not while the line is still at the pit entry (cars turn in there)')
   untilTrue(function() return W.clients[7].oval.dep().me.wave ~= nil end, 30, 'the lucky dog')
   check(W.clients[7].oval.dep().me.wave == 'LUCKY DOG' and shown(W.clients[7], 'LUCKY DOG'), 'the first lapped car is the lucky dog once the line has passed the pit entry, and is told so')
+  run(1)
+  check(cl.oval.pitWindow() == 1 and W.clients[7].oval.local1().out and shown(W.clients[7], 'ТОБІ ЩЕ ЗАКРИТО'), 'out of the line it is still told that the pit lane is not open for it yet')
   check(W.clients[8].oval.dep().me.wave == nil and W.clients[6].oval.dep().me.wave == nil, 'the other lapped car waits for the leader, a car on the lead lap never goes')
   byId[1].isInPitlane = true -- the leader pits, car 8 stays out
   run(1)

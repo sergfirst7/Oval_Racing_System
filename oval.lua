@@ -1184,7 +1184,7 @@ function script.drawUI()
       local who = hudCars[S.cause]
       if S.reason == 2 then add('ТРИМАЙ СВІЙ РЯД - ЗЕЛЕНИЙ НА ЛІНІЇ') elseif who then add(ac.getDriverName(who.index)) end
       if S.reason ~= 2 then
-        local w, lapped = pitWindow(), L1.down and L1.down > 0
+        local w, lapped = pitWindow(), lapsDown(ac.getCar(0), hudCars) > 0 -- not from L1: a car out of the line has none
         add(w == 0 and 'ПІТ-ЛЕЙН ЗАКРИТО' or w == 1 and (lapped and 'ПІТ-ЛЕЙН ЛИШЕ ДЛЯ ЛІДЕРСЬКОГО КОЛА - ТОБІ ЩЕ ЗАКРИТО' or 'ПІТ-ЛЕЙН ВІДКРИТО ДЛЯ ЛІДЕРСЬКОГО КОЛА') or 'ПІТ-ЛЕЙН ВІДКРИТО')
         if finalLap() then add('ОСТАННЄ КОЛО: ШИКУЙТЕСЬ У ДВА РЯДИ') end
       end
