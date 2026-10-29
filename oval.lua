@@ -91,11 +91,11 @@ local function freshDep() return { flags = {}, n = 0, pitted = {}, leader = nil,
 local dep = freshDep()
 local uiTime, lastClock, lastError, hudCars, hudRank, debugOn, greeted = 0, 0, nil, {}, 0, cfg.debug == 1, false
 local infoNote, followKey = nil, nil -- yellow pop-up (whom to follow now), the car we were last told to follow
-local offPace, slowT = {}, {} -- cars that fell out of the line (too slow for too long), how long each one has been slow
+local offPace, slowT, fastT = {}, {}, {} -- cars that fell out of the line (too slow for too long), how long each one has been slow / back up to speed
 
 local function adopt(new) -- local state survives order updates of the same deployment
   if new.phase ~= S.phase or new.tStart ~= S.tStart then L1, watch, ctl = {}, {}, {} end
-  if new.phase == GREEN then offPace, slowT, followKey = {}, {}, nil end
+  if new.phase == GREEN then offPace, slowT, fastT, followKey = {}, {}, {}, nil end
   if new.seq ~= S.seq or new.from ~= S.from then
     ac.log(string.format('Oval: state seq=%d from=%d phase=%d reason=%d cause=%d cars=%d clock=%d', new.seq, new.from, new.phase, new.reason, new.cause, #new.order, math.floor(clock())))
   end
@@ -382,21 +382,22 @@ end
 
 -- What the game itself does with penalties goes to the log (type / parameter / lap / pit lane). A black
 -- flag (a disqualification) is taken back at once, whatever gave it: in an oval race the worst is a gas
--- cut. Tried again after a few seconds if the game keeps it.
-local gamePen, blackAt = '', -100
+-- cut. Tried again after a few seconds if the game keeps it, three times per black flag.
+local gamePen, blackAt, blackTries = '', -100, 0
 local function watchGamePenalty(me)
   local good, kind, param = pcall(function() return me.currentPenaltyType, me.currentPenaltyParameter end) -- fields of the car, not of ac.getSim()
   if not good then return end
   local key = string.format('%s/%s lap %s pit %s', tostring(kind), tostring(param), tostring(me.lapCount), tostring(me.isInPitlane))
   if key ~= gamePen then gamePen = key; ac.log('Oval: game penalty ' .. key) end
   local black = ac.PenaltyType and ac.PenaltyType.BlackFlag
-  if black and kind == black and uiTime - blackAt > 3 then
-    blackAt = uiTime
-    local applied = setPenalty('ReleaseBlackFlag')
-    penNote = { title = 'ЧОРНИЙ ПРАПОР ЗНЯТО', why = 'Дискваліфікації на овалі немає', untilT = uiTime + 7 }
-    pcall(ac.setMessage, penNote.title, penNote.why, 'illegal', 7)
-    ac.log('Oval: black flag released (applied=' .. tostring(applied) .. ')')
-  end
+  if not black or kind ~= black then blackTries = 0 return end
+  if uiTime - blackAt < 3 or blackTries > 3 then return end
+  blackAt, blackTries = uiTime, blackTries + 1
+  local applied = blackTries <= 3 and setPenalty('ReleaseBlackFlag')
+  penNote = applied and { title = 'ЧОРНИЙ ПРАПОР ЗНЯТО', why = 'Дискваліфікації на овалі немає', untilT = uiTime + 7 }
+    or { title = 'ЧОРНИЙ ПРАПОР НЕ ЗНЯТО', why = 'Гра не дає його зняти, клич адміна', untilT = uiTime + 7 }
+  pcall(ac.setMessage, penNote.title, penNote.why, 'illegal', 7)
+  ac.log(string.format('Oval: black flag, release try %d (applied=%s)', blackTries, tostring(applied)))
 end
 
 -- ── rules for the local car ──────────────────────────────────────────────────
@@ -525,27 +526,42 @@ local function watchPits(me, cars)
   end
 end
 
--- On the last lap of a caution the lucky dog (the first car a lap down, unless it caused the caution) and
--- the wave-arounds (cars a lap or more down that stayed out while the leader pitted) go round the field:
--- past the line and the pace car, a lap at speed, to the back of the line. That gives them their lap back.
+-- The lucky dog (the first car a lap down, unless it caused the caution) and the wave-arounds (cars a lap
+-- or more down that stay out while the leader pits) go round the field: past the line and the pace car, a
+-- lap at speed, to the back of the line. That gives them their lap back. They go about two laps before the
+-- green flag: the lucky dog when the pit lane opens for the lead lap, a wave-around when the leader comes in.
+-- One lap is too short: to gain a lap in one pace lap a car needs twice the pace (280 km/h behind a pace
+-- car at 140). A car that goes into the pit lane after all gets no lap back and lines up by the race order.
 local function watchWave(me, cars)
   local m = dep.me
-  if S.phase == GREEN or S.reason == 2 then return end
-  if not m.waveJudged and finalLap() then
-    m.waveJudged = true
-    if me.isInPitlane or lapsDown(me, cars) < 1 then return end
-    local lucky = me.sessionID ~= S.cause
-    for _, id in ipairs(S.order) do -- the line is the race order: a lapped car ahead of me is the lucky dog
-      if id == me.sessionID then break end
-      if cars[id] and lapsDown(cars[id], cars) >= 1 then lucky = false break end
-    end
-    local wave = not dep.pitted[me.sessionID] and dep.leader ~= nil and dep.pitted[dep.leader] == true
-    if not lucky and not wave then return end
-    m.wave, m.down = lucky and 'LUCKY DOG' or 'WAVE AROUND', lapsDown(me, cars)
-    flagMe(WAVE)
-    infoNote = { title = m.wave, why = 'ОБ\'ЇДЬ КОЛОНУ І SAFETY CAR, НАЗДОЖЕНИ КОЛОНУ ЗЗАДУ', untilT = uiTime + 8 }
-    ac.log('Oval: ' .. m.wave)
+  if S.phase ~= CAUTION or S.reason == 2 then return end
+  if m.wave and not m.joined and me.isInPitlane then
+    ac.log('Oval: ' .. m.wave .. ' called off, the car went into the pit lane')
+    m.wave, m.off = nil, true
+    local mine = dep.flags[me.sessionID]
+    if mine and mine.kind == WAVE then flagMe(0) end -- a closed pit lane (TAIL, just set) stays as it is
   end
+  if m.wave or m.off or me.isInPitlane or finalLap() or pitWindow() < 1 then return end
+  local down = lapsDown(me, cars)
+  if down < 1 then return end
+  if m.luckyJudged == nil then -- once, when the pit lane opens: the line is the race order, a lapped car ahead of me is the lucky dog
+    m.luckyJudged = me.sessionID ~= S.cause
+    for _, id in ipairs(S.order) do
+      if id == me.sessionID then break end
+      if cars[id] and lapsDown(cars[id], cars) >= 1 then m.luckyJudged = false break end
+    end
+  end
+  local wave = not dep.pitted[me.sessionID] and dep.leader ~= nil and dep.pitted[dep.leader] == true
+  if not m.luckyJudged and not wave then return end
+  m.wave, m.down = m.luckyJudged and 'LUCKY DOG' or 'WAVE AROUND', down
+  flagMe(WAVE)
+  infoNote = { title = m.wave, why = 'ОБ\'ЇДЬ КОЛОНУ І SAFETY CAR, НАЗДОЖЕНИ КОЛОНУ ЗЗАДУ', untilT = uiTime + 8 }
+  ac.log('Oval: ' .. m.wave)
+end
+
+local function watchJoin(me, cars)
+  local m = dep.me
+  if S.phase == GREEN or S.reason == 2 then return end
   if m.wave and not m.joined then -- past the leader (the lap is back), then up to the last car of the line from behind
     local d, last = behindPace(me), cars[S.order[#S.order]]
     if lapsDown(me, cars) < m.down and last and d > behindPace(last) and d - behindPace(last) < 100 then
@@ -653,13 +669,15 @@ end
 local function moving(c) return not c.isInPitlane and not c.isRetired and c.speedKmh > STOP_KMH end
 
 -- A car below 70 % of the pace for offPaceSec (stopped, wrecked, limping) leaves the line, so
--- the cars behind it pass it and keep the pace. Back up to speed, it rejoins where it is.
+-- the cars behind it pass it and keep the pace. Back up to speed for offPaceSec, it rejoins where
+-- it is (not at once: a car going just about that speed would jump in and out of the line).
 local function watchPace(cars, dt)
   local launching = S.reason == 2 and clock() - S.tStart < 15000
   for id, c in pairs(cars) do
     local slow = not launching and not c.isInPitlane and not c.isRetired and c.speedKmh < offPaceKmh()
     slowT[id] = slow and (slowT[id] or 0) + dt or 0
-    if slowT[id] >= cfg.offPaceSec then offPace[id] = true elseif not slow then offPace[id] = nil end
+    fastT[id] = not slow and (fastT[id] or 0) + dt or 0
+    if slowT[id] >= cfg.offPaceSec then offPace[id] = true elseif fastT[id] >= cfg.offPaceSec then offPace[id] = nil end
   end
 end
 
@@ -756,7 +774,7 @@ end
 local function isActive() return cfg.everySession == 1 or sessionType() == RACE end
 local function reset()
   S, L1, watch, ctl, start, greeted, pen, penNote = freshState(), {}, {}, {}, {}, false, { strikes = 0, last = {} }, nil
-  infoNote, followKey, offPace, slowT, dep, flagOut = nil, nil, {}, {}, freshDep(), nil
+  infoNote, followKey, offPace, slowT, fastT, dep, flagOut = nil, nil, {}, {}, {}, freshDep(), nil
 end
 try('session start events', ac.onSessionStart, reset)
 
@@ -997,6 +1015,8 @@ function script.update(dt)
     if pit == nil then loadPit() end
 
     local cars, me = activeCars(), ac.getCar(0)
+    -- a client that has left is no script user any more: its session ID may go to a player without the script
+    for id in pairs(presence) do if not cars[id] then presence[id] = nil end end
     local rank = 0
     for id in pairs(cars) do if id < me.sessionID then rank = rank + 1 end end
     hudCars, hudRank = cars, rank
@@ -1004,6 +1024,7 @@ function script.update(dt)
     control(cars, dt, rank)
     watchPits(me, cars)
     watchWave(me, cars)
+    watchJoin(me, cars)
     localCheck(cars, dt)
     limit(me)
     watchGamePenalty(me)
@@ -1156,6 +1177,7 @@ function script.drawUI()
       if S.reason ~= 2 then
         local w, lapped = pitWindow(), L1.down and L1.down > 0
         add(w == 0 and 'ПІТ-ЛЕЙН ЗАКРИТО' or w == 1 and (lapped and 'ПІТ-ЛЕЙН ЛИШЕ ДЛЯ ЛІДЕРСЬКОГО КОЛА - ТОБІ ЩЕ ЗАКРИТО' or 'ПІТ-ЛЕЙН ВІДКРИТО ДЛЯ ЛІДЕРСЬКОГО КОЛА') or 'ПІТ-ЛЕЙН ВІДКРИТО')
+        if finalLap() then add('ОСТАННЄ КОЛО: ШИКУЙТЕСЬ У ДВА РЯДИ') end
       end
     end
     if not showGreen and not demo then

@@ -10,7 +10,7 @@ local function frac(x) return x - math.floor(x) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 
 local W = { t = 0, cars = {}, clients = {}, queue = {}, errors = {}, logs = {}, oldApi = {} } -- t in seconds
-local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray, W.penaltyFails, W.pitLane = 0, {}, {}, {}, 60, false, { rolling = 0, paceKmh = 100 }, true, 0, false, 'ok', false, nil end
+local function resetWorld() W.t, W.cars, W.clients, W.queue, W.catchup, W.hold, W.defaults, W.tts, W.clockOffset, W.modelFails, W.ray, W.penaltyFails, W.pitLane = 0, {}, {}, {}, 60, false, { rolling = 0, paceKmh = PACE or 100 }, true, 0, false, 'ok', false, nil end -- PACE: the pace car speed of the world (100 unless a run sets it)
 
 -- ── fake API ─────────────────────────────────────────────────────────────────
 local V = {}
@@ -224,7 +224,7 @@ local function target(car, phase, pace, paceKmh, st, l1)
   if l1 and l1.lane == 'out' and prev then ahead[prev] = nil end -- two abreast: he drives up beside his row mate (one lane in this world)
   local gap, aheadKmh = TRACK, paceKmh
   for _, o in ipairs(W.cars) do
-    if ahead[o.sessionID] and o.isConnected and not o.isInPitlane and o.speedKmh > 70 then -- a slow car he drives around
+    if ahead[o.sessionID] and o.isConnected and not o.isInPitlane and o.speedKmh > 0.7 * paceKmh then -- a slow car he drives around
       local g = frac(o.splinePosition - car.splinePosition) * TRACK
       if g < gap then gap, aheadKmh = g, o.speedKmh end
     end
@@ -256,7 +256,7 @@ local function step()
       local cl = phaseOf[c] or W.clients[1] -- a car without the script still obeys what its driver sees
       local st = cl.oval.state()
       local pace = st.phase == CAUTION and cl.oval.pacePos() or nil
-      local want = target(c, st.phase, pace, 100, st, cl.car == c and cl.oval.local1() or nil) / 3.6
+      local want = target(c, st.phase, pace, st.kmh > 0 and st.kmh or 100, st, cl.car == c and cl.oval.local1() or nil) / 3.6
       local v = c.speedKmh / 3.6
       v = v < want and math.min(want, v + 5 * DT) or math.max(want, v - 10 * DT)
       c.speedKmh = v * 3.6
@@ -275,6 +275,7 @@ local function run(sec) for _ = 1, math.floor(sec / DT) do step() end end
 
 -- ── scenarios ────────────────────────────────────────────────────────────────
 local function check(cond, msg) if not cond then error('FAIL: ' .. msg, 2) end print('ok   ' .. msg) end
+local function K() return 100 / W.defaults.paceKmh end -- times measured in a world at 100 km/h, scaled to its pace
 
 local function field(n, gap, kmh, cfgOverride, adminId, noScript) -- n cars `gap` metres apart, one client per car
   resetWorld()
@@ -379,6 +380,7 @@ local function scenarioManual()
   local late = addCar(10, 0.2, 100)
   disconnect(W.clients[admin])
   run(2)
+  check(W.clients[1].oval.presence()[admin] == nil, 'a client that left is off the list of script users (its session ID may go to a player without the script)')
   local lateClient = addClient(late, false, noRestart)
   run(1)
   check(lateClient.oval.state().phase == CAUTION, 'late joiner gets the caution from a re-announcing controller')
@@ -449,7 +451,7 @@ local function scenarioAuto()
   end
   print(string.format('     one to go after %.0f s of caution, widest gap in the pack %.0f m', W.t - cautionAt, worst))
   -- green after the pit cycle and one more lap: 2.3..3.3 pace laps of 90 s, one to go a quarter of a lap before that
-  check(W.t - cautionAt > 180 and W.t - cautionAt < 280, 'two to three pace laps, although a car stood on track: one to go after ' .. string.format('%.0f', W.t - cautionAt) .. ' s')
+  check(W.t - cautionAt > 180 * K() and W.t - cautionAt < 280 * K(), 'two to three pace laps, although a car stood on track: one to go after ' .. string.format('%.0f', W.t - cautionAt) .. ' s')
   check(worst < 60, 'the field is bunched when one to go is shown')
   runClean(1)
   everyone(ONE_TO_GO, 'shows one to go')
@@ -482,10 +484,29 @@ local function scenarioStraggler()
   local at = W.t
   byId[1].isInPitlane = true
   run(20)
-  check(shown(sc, 'ДОДАЙ') and sc.oval.local1().target > 115, 'the straggler sees SPEED UP and a target above the pace (' .. math.floor(sc.oval.local1().target) .. ' km/h)')
+  check(shown(sc, 'ДОДАЙ') and sc.oval.local1().target > W.defaults.paceKmh + 15, 'the straggler sees SPEED UP and a target above the pace (' .. math.floor(sc.oval.local1().target) .. ' km/h)')
   untilTrue(function() return W.clients[2].oval.state().phase == GREEN end, 400, 'the green flag')
   print(string.format('     green after %.0f s of caution', W.t - at))
-  check(W.t - at < 250, 'green after at most 2.5 pace laps, although the straggler is still far back')
+  check(W.t - at < 250 * K(), 'green after at most 2.5 pace laps, although the straggler is still far back')
+end
+
+local function scenarioHover()
+  print('== a car at about 70 % of the pace does not jump in and out of the line')
+  local pace = PACE or 100
+  local byId = field(6, 45, pace, nil, 1)
+  run(10)
+  W.clients[1].chat('!yellow')
+  run(30)
+  local function inLine() return table.concat(W.clients[2].oval.state().order, ','):find('3', 1, true) ~= nil end
+  byId[3].limp = 0.6 * pace
+  run(6)
+  check(not inLine(), 'too slow for offPaceSec: out of the line')
+  byId[3].limp = 0.8 * pace
+  run(1.5)
+  check(not inLine(), 'just back above the line speed it stays out for now')
+  run(4)
+  check(inLine(), 'back up to speed for offPaceSec: in the line again')
+  byId[3].limp = nil
 end
 
 local function scenarioGiveUp()
@@ -498,7 +519,7 @@ local function scenarioGiveUp()
   run(10)
   check(W.clients[3].oval.local1().out == true and shown(W.clients[3], 'ПОЗА КОЛОНОЮ'), 'the stopped car is out of the line and its driver is told so')
   untilTrue(function() return W.clients[1].oval.state().phase == GREEN end, 400, 'the green flag')
-  check(W.t - at > 130 and W.t - at < 250, 'green after about two pace laps (' .. math.floor(W.t - at) .. ' s), the car is still standing')
+  check(W.t - at > 130 * K() and W.t - at < 250 * K(), 'green after about two pace laps (' .. math.floor(W.t - at) .. ' s), the car is still standing')
   byId[3].stopped = false
 end
 
@@ -624,7 +645,7 @@ local function scenarioRolling(useCountdown)
   end
   local g = W.clients[1].oval.state()
   local took = W.t - started
-  check(g.phase == GREEN and g.reason == 0 and g.seq > st.seq and took > 85 and took < 135, 'one pace lap, then the start: green after ' .. string.format('%.0f', took) .. ' s')
+  check(g.phase == GREEN and g.reason == 0 and g.seq > st.seq and took > 85 * K() and took < 135 * K(), 'one pace lap, then the start: green after ' .. string.format('%.0f', took) .. ' s')
   check(g.seq == st.seq + 2, 'the pace car left on the last part of that lap: exactly two messages (one to go, green), not an extra lap')
   for _, cl in ipairs(W.clients) do check(#cl.penalties == 0, 'client ' .. cl.car.sessionID .. ' was not penalised at the start') end
   check(not watch.dirty, 'nobody who followed the rules was warned' .. (watch.dirty and (': ' .. watch.dirty) or ''))
@@ -658,7 +679,7 @@ local function scenarioLeaderless()
   for _, c in pairs(byId) do c.isInPitlane = true end -- everybody dives into the pits
   local at = W.t
   untilTrue(function() return W.clients[1].oval.state().phase == GREEN end, 200, 'the green flag')
-  check(W.t - at < 150, 'the flag turns green by itself after 1.5 laps (' .. string.format('%.0f', W.t - at) .. ' s)')
+  check(W.t - at < 150 * K(), 'the flag turns green by itself after 1.5 laps (' .. string.format('%.0f', W.t - at) .. ' s)')
 end
 
 local function scenarioModel()
@@ -782,7 +803,7 @@ local function scenarioPitLane()
 end
 
 -- metres a car needs to slow down to the pace at 3 m/s2, plus 50 (the rule of the script)
-local function brakeRoom(kmh) local v, p = kmh / 3.6, 100 / 3.6; return (v > p and (v * v - p * p) / 6 or 0) + 50 end
+local function brakeRoom(kmh) local v, p = kmh / 3.6, W.defaults.paceKmh / 3.6; return (v > p and (v * v - p * p) / 6 or 0) + 50 end
 
 local function scenarioClearRoad()
   print('== the pace car never appears close in front of a fast car')
@@ -947,10 +968,10 @@ local function scenarioPenalties()
   check(kinds(W.clients[5]):find('GasCut', 1, true) and not kinds(W.clients[5]):find('MandatoryPits', 1, true), 'only gas cuts (' .. kinds(W.clients[5]) .. ')')
 
   print('== passing the pace car counts double')
-  local b2 = field(8, 45, 100, { paceLeadM = 20 }, 1) -- at the pace speed: the pace car appears 50 m ahead
+  local b2 = field(8, 45, PACE or 100, { paceLeadM = 20 }, 1) -- at the pace speed: the pace car appears 50 m ahead
   run(10)
   W.clients[1].chat('!yellow')
-  b2[1].hold = 125 -- the leader drives past the pace car while the others still slow down
+  b2[1].hold = (PACE or 100) + 25 -- the leader drives past the pace car while the others still slow down
   run(30)
   check(kinds(W.clients[1]):sub(1, 6) == 'GasCut' and W.clients[1].messages[1]:find('Обгін safety car', 1, true), 'a gas cut at the very first violation: ' .. (W.clients[1].messages[1] or '-'))
 
@@ -1036,12 +1057,12 @@ local function scenarioDomino()
       for i = 4, 8 do minSpeed = math.min(minSpeed, byId[o[i]].speedKmh) end
       for i = 2, #o do
         local a, b = byId[o[i - 1]], byId[o[i]]
-        if a.speedKmh > 70 and b.speedKmh > 70 then minGap = math.min(minGap, frac(a.splinePosition - b.splinePosition) * TRACK) end
+        if a.speedKmh > 0.7 * W.defaults.paceKmh and b.speedKmh > 0.7 * W.defaults.paceKmh then minGap = math.min(minGap, frac(a.splinePosition - b.splinePosition) * TRACK) end -- cars in the line, not the one being passed
       end
     end
     byId[3].limp = nil
     print(string.format('     car 3 at %d km/h: the cars behind it never below %.0f km/h, closest gap %.0f m', slowTo, minSpeed, minGap))
-    check(minSpeed > slowTo - 5 and minSpeed > 65 and minGap > 8, 'nobody behind it brakes hard or runs into the next car (car 3 at ' .. slowTo .. ' km/h)')
+    check(minSpeed > slowTo - 5 and minSpeed > 0.65 * W.defaults.paceKmh and minGap > 8, 'nobody behind it brakes hard or runs into the next car (car 3 at ' .. slowTo .. ' km/h)')
   end
 end
 
@@ -1092,36 +1113,40 @@ local function scenarioPitRules()
 end
 
 local function scenarioWave()
-  print('== the last lap: the lucky dog and a wave-around go round the field, the line doubles up')
+  print('== the lucky dog and a wave-around go round the field about two laps before the green, the line doubles up on the last lap')
   local byId = lappedField(false)
   local cl = W.clients[1]
+  check(W.clients[7].oval.dep().me.wave == nil, 'nobody goes round while the pit lane is closed')
   untilTrue(function() return cl.oval.pitWindow() == 1 end, 200, 'the pit lane open for the lead lap')
-  byId[1].isInPitlane = true -- the leader pits, the lapped cars stay out
-  run(4); byId[1].isInPitlane = false
-  check(W.clients[2].oval.local1().lane == nil, 'single file before the last lap')
-  untilTrue(function() return W.clients[7].oval.dep().me.wave ~= nil end, 300, 'the last lap')
   run(0.5)
-  check(W.clients[7].oval.dep().me.wave == 'LUCKY DOG' and W.clients[8].oval.dep().me.wave == 'WAVE AROUND', 'the first lapped car is the lucky dog, the other one stayed out while the leader pitted: a wave-around')
-  check(W.clients[6].oval.dep().me.wave == nil and shown(W.clients[7], 'LUCKY DOG'), 'a car on the lead lap does not go, the lucky dog is told to')
+  check(W.clients[7].oval.dep().me.wave == 'LUCKY DOG' and shown(W.clients[7], 'LUCKY DOG'), 'the first lapped car is the lucky dog as soon as the pit lane opens, and is told so')
+  check(W.clients[8].oval.dep().me.wave == nil and W.clients[6].oval.dep().me.wave == nil, 'the other lapped car waits for the leader, a car on the lead lap never goes')
+  byId[1].isInPitlane = true -- the leader pits, car 8 stays out
+  run(1)
+  check(W.clients[8].oval.dep().me.wave == 'WAVE AROUND', 'the leader is in the pit lane: the lapped car that stays out is a wave-around')
+  run(3); byId[1].isInPitlane = false
   run(1)
   for _, c in ipairs(W.clients) do
     local o = table.concat(c.oval.state().order, ',')
     check(not o:find('7', 1, true) and not o:find('8', 1, true), 'client ' .. c.car.sessionID .. ': both are out of the line while they go round (' .. o .. ')')
   end
-  check(W.clients[2].oval.local1().lane == 'out' and W.clients[3].oval.local1().lane == 'in', 'the line doubles up: odd places inside, even places outside')
-  for _, id in ipairs({ 7, 8 }) do byId[id].ignore, byId[id].cruise = true, 230 end -- flat out round the track
+  check(W.clients[2].oval.local1().lane == nil, 'single file before the last lap')
+  local fast = 1.6 * W.defaults.paceKmh -- well under racing speed: two pace laps are enough at 1.6 times the pace
+  for _, id in ipairs({ 7, 8 }) do byId[id].ignore, byId[id].cruise = true, fast end
   local o7 = byId[7].lapCount + byId[7].splinePosition
-  untilTrue(function() return flagOf(1, 7) == 1 and flagOf(1, 8) == 1 end, 120, 'both back at the end of the line')
+  untilTrue(function() return flagOf(1, 7) == 1 and flagOf(1, 8) == 1 end, 200 * K(), 'both back at the end of the line')
   for _, id in ipairs({ 7, 8 }) do byId[id].ignore = false end
-  check(byId[7].lapCount + byId[7].splinePosition - o7 > 1, 'the lucky dog drove a lap more than the field: its lap is back')
+  check(byId[7].lapCount + byId[7].splinePosition - o7 > 1 and cl.oval.state().phase == CAUTION, 'the lucky dog drove a lap more than the field, before the green flag: its lap is back')
   run(1)
   local o = cl.oval.state().order
   check(o[#o - 1] == 7 and o[#o] == 8, 'they line up at the very end, in the order they came (' .. table.concat(o, ',') .. ')')
-  untilTrue(function() return cl.oval.state().phase == ONE_TO_GO end, 120, 'one to go')
+  untilTrue(function() return W.clients[2].oval.local1().lane ~= nil end, 200 * K(), 'the last lap')
+  check(W.clients[2].oval.local1().lane == 'out' and W.clients[3].oval.local1().lane == 'in' and shown(W.clients[3], 'ДВА РЯДИ'), 'on the last lap the line doubles up: odd places inside, even places outside, and the HUD says so')
+  untilTrue(function() return cl.oval.state().phase == ONE_TO_GO end, 200 * K(), 'one to go')
   o = cl.oval.state().order
   local function apart(a, b) return math.abs(frac(byId[a].splinePosition - byId[b].splinePosition + 0.5) - 0.5) * TRACK end
   check(apart(o[1], o[2]) < 12 and apart(o[3], o[4]) < 12, string.format('two abreast at one to go (rows %.0f m and %.0f m)', apart(o[1], o[2]), apart(o[3], o[4])))
-  untilTrue(function() return cl.oval.state().phase == GREEN end, 120, 'the green flag')
+  untilTrue(function() return cl.oval.state().phase == GREEN end, 200 * K(), 'the green flag')
   for _, c in ipairs(W.clients) do check(#c.penalties == 0, 'client ' .. c.car.sessionID .. ' got no penalty for the wave or the rows') end
 end
 
@@ -1190,6 +1215,7 @@ scenarioNoScript()
 scenarioAuto()
 scenarioLapped()
 scenarioDomino()
+scenarioHover()
 scenarioGiveUp()
 scenarioStraggler()
 scenarioHud()
