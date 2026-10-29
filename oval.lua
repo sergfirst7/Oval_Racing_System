@@ -2,7 +2,7 @@
 -- One file, the same code runs on every client. State is shared with ac.OnlineEvent,
 -- the pace car position is computed from the synced session clock. See README.md.
 
-local VERSION = 'Oval 10.3'
+local VERSION = 'Oval 11.0'
 local sim = ac.getSim()
 
 -- Every value can be overridden in the [SCRIPT_x] section of the server's CSP extra options.
@@ -10,28 +10,31 @@ local cfgDefaults = {
   paceKmh = 100,       -- pace car speed
   speedTolKmh = 8,     -- speed above the target that still counts as fine
   catchupKmh = 60,     -- extra speed allowed while closing a big gap to your place in the line
-  bunchGapM = 30,      -- gap between two places in the line (the leader keeps it to the pace car)
+  gapSec = 0.6,        -- gap between two places in the line at the pace speed, seconds (the leader keeps it to the pace car)
   limiter = 1,         -- 1: the gas is cut above the target speed of your place (like a pit limiter), 0: off
   offPaceSec = 3,      -- a car below 70 % of the pace for this long leaves the line, it rejoins where it is when back up to speed
-  paceLeadM = 300,     -- how far ahead of the race leader the pace car appears
-  autoCaution = 1,     -- 1: a wreck or a car stopped on track calls the caution automatically
+  paceLeadM = 300,     -- the pace car appears at least this far ahead of the race leader, and never close in front of a fast car
+  autoCaution = 1,     -- 1: a wreck with another car, or a car stopped on the road, calls the caution automatically
   slowKmh = 40,        -- below this speed a car counts as stopped
   limpRatio = 0.5,     -- a car that stays below this share of its own top speed (and under 110 km/h) counts as stopped, 0 = off
   wreckDropKmh = 60,   -- losing this much speed within 0.4 s (35 within a second of a contact) is a wreck
-  stopSec = 3,         -- how long a car must stay that slow to count as an incident
+  offRoadM = 2,        -- a car this far beyond the edge of the road endangers nobody: a crash on its own that ends there calls no caution
+  stopSec = 3,         -- how long a car must stay that slow on the road to count as an incident
   raceKmh = 80,        -- a car only counts after it has been this fast since the last green
   cooldownSec = 4,     -- no automatic caution in the first seconds after a green flag
-  penalty = 'drive',   -- what breaking the pace rules costs: 'off' (warnings only), 'slow' (up to a gas cut), 'drive' (up to a drive-through)
-  graceSec = 6,        -- time to slow down after the pace car appears before violations count
+  penalty = 'slow',    -- what breaking the pace rules costs: 'off' (warnings only), 'slow' (a gas cut; never a drive-through or a black flag)
+  graceSec = 10,       -- time to slow down after the pace car appears before violations count
   speedSec = 4,        -- being too fast for this long is a violation
   passSec = 1.2,       -- being ahead of the car in front for this long is a violation
   strikeGapSec = 8,    -- the same violation is counted at most once per this many seconds
   slowSec = 5,         -- length of the gas cut penalty
-  driveLaps = 3,       -- laps the game gets to serve a drive-through ('drive' only)
   rolling = 1,         -- 1: the race starts behind the pace car (rolling start); 0: standing start
   formationLaps = 1,   -- pace laps of the rolling start before the field may go green
   startLeadM = 40,     -- how far ahead of pole position the pace car starts
-  cautionLaps = 2,     -- pace laps of a caution: green at the line after 1.5..2.5 laps, nothing makes it longer
+  cautionLaps = 2,     -- the shortest caution, pace laps: green at the line after 1.5..2.5 laps at least. The pit lane is
+                       -- closed until the pace car has passed the pit entry, then open for the cars on the lead lap, from
+                       -- its next pass for everybody; the last lap only comes after that (2.3..3.3 laps on an oval).
+                       -- On the last lap the lucky dog and the wave-arounds go round the field, the line doubles up.
   oneToGoAt = 0.75,    -- the pace car leaves in the last quarter of a lap (track position 0..1), green at the line
   paceModel = 'content/cars/aston_vantage2018/aston_vantage2018.kn5', -- 3D model of the pace car, '' for the arrow marker only
   paceFlip = 0,        -- 1: turn the model around if it drives backwards
@@ -82,6 +85,10 @@ local function freshState() return { seq = 0, from = NONE, phase = GREEN, reason
 local S = freshState()
 local L1, watch, ctl = {}, {}, {} -- rules of the local car / incident watch of the local car / restart bookkeeping
 local pen, penNote, lastContact = { strikes = 0, last = {} }, nil, -100 -- penalties of the local car, the message about the last one, last contact
+-- one pace car deployment: what each car said about itself (flags: 'tail' = restarts at the back, 'wave' = goes
+-- round the field), who has been in the pit lane, the leader when it began, and what the local car did
+local function freshDep() return { flags = {}, n = 0, pitted = {}, leader = nil, me = {} } end
+local dep = freshDep()
 local uiTime, lastClock, lastError, hudCars, hudRank, debugOn, greeted = 0, 0, nil, {}, 0, cfg.debug == 1, false
 local infoNote, followKey = nil, nil -- yellow pop-up (whom to follow now), the car we were last told to follow
 local offPace, slowT = {}, {} -- cars that fell out of the line (too slow for too long), how long each one has been slow
@@ -92,8 +99,11 @@ local function adopt(new) -- local state survives order updates of the same depl
   if new.seq ~= S.seq or new.from ~= S.from then
     ac.log(string.format('Oval: state seq=%d from=%d phase=%d reason=%d cause=%d cars=%d clock=%d', new.seq, new.from, new.phase, new.reason, new.cause, #new.order, math.floor(clock())))
   end
-  if new.phase == CAUTION and S.phase == GREEN then pen.strikes, pen.last = 0, {} end -- a new deployment: a clean sheet
+  if new.phase == CAUTION and S.phase == GREEN or new.phase == GREEN and S.phase ~= GREEN then -- a new deployment, or the end of one: a clean sheet
+    pen.strikes, pen.last, dep = 0, {}, freshDep()
+  end
   S = new
+  if S.phase == CAUTION and S.reason ~= 2 and not dep.leader then dep.leader = S.order[1] end
 end
 
 local sendEvent, accessEvent, outbox
@@ -120,7 +130,7 @@ end
 
 local ok, s, a = pcall(function()
   return ac.OnlineEvent({
-    ac.StructItem.key('ovalState8'),
+    ac.StructItem.key('ovalState9'),
     seq = ac.StructItem.int32(),
     tStart = ac.StructItem.int32(),
     s0 = ac.StructItem.float(),
@@ -133,6 +143,29 @@ local ok, s, a = pcall(function()
   }, onState)
 end)
 if ok then sendEvent, accessEvent = s, a else ac.log('Oval: online events unavailable: ' .. tostring(s)) end
+
+-- What a car says about itself in this deployment: 1 = it restarts at the back of the line (it went into a
+-- closed pit lane), 2 = it goes round the field (lucky dog, wave-around) and is out of the line until it
+-- gets to the back of it. Every client keeps the list; the client that orders the line puts the cars there.
+local TAIL, WAVE = 1, 2
+local function onFlag(sender, d)
+  if not sender or S.phase == GREEN then return end
+  local id, f = sender.sessionID, dep.flags[sender.sessionID]
+  if f and f.kind == d.kind then return end
+  dep.n = dep.n + 1
+  dep.flags[id] = { kind = d.kind, n = dep.n }
+  ac.log(string.format('Oval: car %d flag %d', id, d.kind))
+end
+local okFlag, sendFlag, accessFlag = pcall(function() return ac.OnlineEvent({ ac.StructItem.key('ovalCar9'), kind = ac.StructItem.uint8() }, onFlag) end)
+if not okFlag then ac.log('Oval: car flags unavailable: ' .. tostring(sendFlag)); sendFlag, accessFlag = nil, nil end
+local flagOut
+local function flagMe(kind) -- set here at once, sent to the others as soon as the rate limit lets it go
+  local id = ac.getCar(0).sessionID
+  if dep.flags[id] and dep.flags[id].kind == kind then return end
+  dep.n = dep.n + 1
+  dep.flags[id], flagOut = { kind = kind, n = dep.n }, kind
+  ac.log(string.format('Oval: my flag %d', kind))
+end
 
 -- Puts a message into the shared buffer and queues it for everybody else.
 local outboxAt
@@ -171,11 +204,16 @@ local function behindPace(c)
   return frac(pacePos() + SLACK / len - c.splinePosition) * len - SLACK
 end
 
--- the pace car's crossings of the line so far, and the crossing that brings the green flag:
--- the one after 1.5..2.5 laps (cautionLaps = 2), the first one of a rolling start
+-- the pace car's crossings of the line so far, and the crossing that brings the green flag: the first
+-- one of a rolling start; under a caution the one after 1.5..2.5 laps (cautionLaps = 2), but never before
+-- the pit cycle is through: the last lap begins after the pit lane has opened for everybody (pitWindow)
+local pit, goAt -- the pit lane, read from the track (below)
 local function greenLine()
-  local need = S.reason == 2 and cfg.formationLaps or cfg.cautionLaps
-  return math.floor(paceRun()), math.max(1, math.ceil(S.s0 + need - 0.5))
+  local crossed = math.floor(paceRun())
+  if S.reason == 2 then return crossed, math.max(1, math.ceil(S.s0 + cfg.formationLaps - 0.5)) end
+  local e, first = pit and pit.inS or goAt(), S.s0 + 0.25
+  local everybody = first + frac(e - first) + 1 -- the pace car's second counted pass of the pit entry
+  return crossed, math.max(1, math.ceil(S.s0 + cfg.cautionLaps - 0.5), math.ceil(everybody) + 1)
 end
 
 -- ── the pit lane ─────────────────────────────────────────────────────────────
@@ -190,7 +228,7 @@ local function f32(s, i) -- little-endian IEEE 754
   return d >= 128 and -x or x
 end
 
-local pit -- nil: not read yet, false: none, else { pts, a, b (pit lane proper), inI (where the pace car turns in), exitS, inS }
+-- pit: nil: not read yet, false: none, else { pts, a, b (pit lane proper), inI (where the pace car turns in), exitS, inS }
 local function loadPit()
   pit = false
   local good, data = pcall(function() return io.load((ac.getTrackDataFilename('x'):gsub('data[/\\]x$', 'ai/pit_lane.ai'))) end)
@@ -220,13 +258,45 @@ local function loadPit()
 end
 
 -- where the pace car leaves the road for good (one to go): at the pit lane, if it is in the second half of the lap
-local function goAt() return pit and pit.inS > 0.5 and pit.inS < 0.97 and pit.inS or cfg.oneToGoAt end
+function goAt() return pit and pit.inS > 0.5 and pit.inS < 0.97 and pit.inS or cfg.oneToGoAt end
 
 local function ahead(a, b) -- is car a ahead of car b in the race
   local pa, pb = a.racePosition or 0, b.racePosition or 0
   if pa > 0 and pb > 0 and pa ~= pb then return pa < pb end
   if S.seq == 0 and a.lapCount == 0 and b.lapCount == 0 then return frac(-a.splinePosition) < frac(-b.splinePosition) end -- on the grid: closest before the line
   return a.lapCount + a.splinePosition > b.lapCount + b.splinePosition
+end
+
+-- metres a car needs to slow down from its speed to the pace gently (3 m/s2), plus a margin
+local function brakeRoom(c)
+  local v, p = c.speedKmh / 3.6, cfg.paceKmh / 3.6
+  return (v > p and (v * v - p * p) / 6 or 0) + 50
+end
+
+-- The pace car never pops up in front of a fast car: it appears at the first point from `from` on that has
+-- every car (not in the pits) at least its braking room behind it. The pit exit is better when it is such a
+-- point and not much further: there the pace car comes out of the pit lane. Nowhere clear: `from`.
+local function clearPoint(cars, headS, from)
+  local len = trackLen()
+  local function blocker(p)
+    for _, c in pairs(cars) do
+      if not c.isInPitlane and frac(p - c.splinePosition) * len < brakeRoom(c) then return c end
+    end
+  end
+  local p, moved = from, 0
+  for _ = 1, 2 * ORDER_MAX do
+    local c = blocker(p)
+    if not c then
+      if pit and not blocker(pit.exitS) and frac(pit.exitS - headS) <= frac(p - headS) + 0.25 then return pit.exitS end
+      return p
+    end
+    local nextP = frac(c.splinePosition + (brakeRoom(c) + 1) / len)
+    moved = moved + frac(nextP - p)
+    if moved >= 1 then break end
+    p = nextP
+  end
+  ac.log('Oval: no clear stretch of road for the pace car, it appears ahead of the leader')
+  return from
 end
 
 -- reason: 0 admin, 1 stopped car, 2 rolling start, 3 wreck
@@ -238,10 +308,7 @@ local function deploy(reason, cause)
   if not head then return end
   local lead = reason == 2 and cfg.startLeadM or cfg.paceLeadM
   local s0, list = frac(head.splinePosition + lead / trackLen()), {}
-  -- the pace car joins from the pit lane when it gets to the pit exit: if that is just ahead of the
-  -- leader, it starts right there, not a lap later
-  local toExit = pit and reason ~= 2 and frac(pit.exitS - head.splinePosition) * trackLen()
-  if toExit and toExit > 100 and toExit < lead then s0 = pit.exitS end
+  if reason ~= 2 then s0 = clearPoint(cars, head.splinePosition, s0) end
   for _, c in pairs(cars) do
     if not c.isInPitlane and not c.isRetired then list[#list + 1] = c end
   end
@@ -259,8 +326,8 @@ local function release() commit(GREEN, 0, NONE, clock(), 0, {}) end
 
 -- ── penalties ────────────────────────────────────────────────────────────────
 -- Every client judges its own car. Violations are counted per pace car deployment: the first one
--- is a warning, the second cuts the gas, from the third on the gas is cut again (in the experimental
--- 'drive' mode a drive-through is due instead). Passing the pace car and jumping the restart count double.
+-- is a warning, from the second on the gas is cut. Passing the pace car and jumping the restart count
+-- double. Nothing the script does ends a race: no drive-through, no black flag.
 local function setPenalty(kind, param)
   local good, err = pcall(function() physics.setCarPenalty(ac.PenaltyType[kind], param) end)
   if not good then ac.log('Oval: penalty ' .. kind .. ' could not be applied: ' .. tostring(err)) end
@@ -281,11 +348,7 @@ local function penalize(why, weight)
   pen.last[why], pen.strikes = uiTime, pen.strikes + weight
   local level, title, applied = pen.strikes, 'ПОПЕРЕДЖЕННЯ', true
   if cfg.penalty ~= 'off' and level >= 2 then
-    if cfg.penalty == 'drive' and level >= 3 and not pen.owed and not pen.driving then
-      -- Handed out only when the race is green again: a caution is over in about a lap, too soon
-      -- to serve it. Verified in the game: it is served by a run through the pit lane.
-      title, pen.owed = 'ПРОЇЗД ПІТ-ЛЕЙНУ ПІСЛЯ ЗЕЛЕНОГО', true
-    elseif uiTime - (pen.slowAt or -100) < cfg.slowSec + 3 then
+    if uiTime - (pen.slowAt or -100) < cfg.slowSec + 3 then
       title = 'ВІДСІЧКА ГАЗУ (ВЖЕ ДІЄ)' -- a running gas cut is not extended
     else
       title = 'ВІДСІЧКА ГАЗУ ' .. cfg.slowSec .. ' С'
@@ -317,42 +380,22 @@ local function judge(dt)
   end
 end
 
--- a drive-through that is due is handed out once the race is green again
-local function handOutOwed()
-  if not pen.owed or pen.driving or S.phase ~= GREEN or clock() - S.tStart < 2000 then return end
-  pen.owed = false
-  local applied = setPenalty('MandatoryPits', cfg.driveLaps)
-  if applied then pen.driving, pen.pitSeen = true, false end
-  local title = 'ШТРАФ: ПРОЇЗД ПІТ-ЛЕЙНУ' .. (applied and '' or ' (НЕ ЗАСТОСОВАНО)')
-  penNote = { title = title, why = 'Заїжджай на піт-лейн зараз', untilT = uiTime + 7 }
-  pcall(ac.setMessage, title, penNote.why, 'illegal', 7)
-  local me = ac.getCar(0)
-  ac.log(string.format('Oval: %s handed out after the green flag (lap %s, track position %.3f)', title, tostring(me.lapCount), me.splinePosition))
-end
-
--- a drive-through is served once the car has been through the pit lane
-local function servePenalty(me)
-  if not pen.driving then return end
-  if me.isInPitlane then pen.pitSeen = true
-  elseif pen.pitSeen then pen.driving = false; ac.log('Oval: drive-through served') end
-end
-
--- What the game itself does with our penalties goes to the log (type / laps left / lap / pit lane),
--- so its counting of a drive-through can be read off. A car that got the black flag for a
--- drive-through we handed out is set free: the driver must not end up parked in the pits for good.
-local gamePen = ''
+-- What the game itself does with penalties goes to the log (type / parameter / lap / pit lane). A black
+-- flag (a disqualification) is taken back at once, whatever gave it: in an oval race the worst is a gas
+-- cut. Tried again after a few seconds if the game keeps it.
+local gamePen, blackAt = '', -100
 local function watchGamePenalty(me)
   local good, kind, param = pcall(function() return me.currentPenaltyType, me.currentPenaltyParameter end) -- fields of the car, not of ac.getSim()
   if not good then return end
   local key = string.format('%s/%s lap %s pit %s', tostring(kind), tostring(param), tostring(me.lapCount), tostring(me.isInPitlane))
   if key ~= gamePen then gamePen = key; ac.log('Oval: game penalty ' .. key) end
   local black = ac.PenaltyType and ac.PenaltyType.BlackFlag
-  if pen.driving and black and kind == black then
-    pen.driving = false
+  if black and kind == black and uiTime - blackAt > 3 then
+    blackAt = uiTime
     local applied = setPenalty('ReleaseBlackFlag')
-    penNote = { title = 'ЧОРНИЙ ПРАПОР ЗНЯТО', why = 'Проїзд піт-лейну не відбуто', untilT = uiTime + 7 }
+    penNote = { title = 'ЧОРНИЙ ПРАПОР ЗНЯТО', why = 'Дискваліфікації на овалі немає', untilT = uiTime + 7 }
     pcall(ac.setMessage, penNote.title, penNote.why, 'illegal', 7)
-    ac.log('Oval: black flag after a drive-through, released (applied=' .. tostring(applied) .. ')')
+    ac.log('Oval: black flag released (applied=' .. tostring(applied) .. ')')
   end
 end
 
@@ -361,11 +404,30 @@ end
 -- (single file under a caution, two abreast after the grid). The target speed brings you to your
 -- point, not to the car ahead, so one car that slows down does not slow the whole field down.
 local function offPaceKmh() return 0.7 * cfg.paceKmh end
+local function gapM() return cfg.gapSec * cfg.paceKmh / 3.6 end
 local rowGap = { t = nil, m = 16 } -- metres between two rows of the rolling start, measured on the grid
+
+-- the last lap of a caution: from the pace car's last crossing of the line before the green flag
+local function finalLap()
+  if S.phase == ONE_TO_GO then return true end
+  if S.phase ~= CAUTION or S.reason == 2 then return false end
+  local crossed, at = greenLine()
+  return crossed >= at - 1
+end
+local function doubleFile() return S.reason == 2 or finalLap() end -- two abreast: the start, and every restart
 
 local function slotDistance(idx)
   if S.reason == 2 then return cfg.startLeadM + math.floor((idx - 1) / 2) * rowGap.m end
-  return idx * cfg.bunchGapM
+  if doubleFile() then return (1 + math.floor((idx - 1) / 2)) * gapM() end
+  return idx * gapM()
+end
+
+-- The pit lane under a caution: closed until the pace car has passed the pit entry (a quarter of a lap
+-- after it appeared at the earliest), then open for the cars on the lead lap, from its next pass for everybody.
+local function pitWindow() -- 0 closed, 1 lead lap only, 2 open
+  if S.phase ~= CAUTION or S.reason == 2 then return 2 end
+  local e = pit and pit.inS or goAt()
+  return clamp(math.floor(paceRun() - e) - math.floor(S.s0 + 0.25 - e), 0, 2)
 end
 
 local function lapsDown(c, cars)
@@ -380,7 +442,7 @@ local function localCheck(cars, dt)
   local at = {}
   for i, id in ipairs(S.order) do at[id] = i end
   local idx = at[me.sessionID]
-  if not idx then L1 = { out = true } return end -- out of the line: too slow, rejoins when back up to speed
+  if not idx then L1 = { out = true } return end -- out of the line: too slow (rejoins when back up to speed), or going round it
 
   local launching = S.reason == 2 and clock() - S.tStart < 15000 -- cars still accelerate from the grid
   if S.reason == 2 and S.phase == CAUTION and rowGap.t ~= S.tStart then
@@ -400,7 +462,9 @@ local function localCheck(cars, dt)
   if L1.rel and math.abs(rel - L1.rel) > 200 then L1.seenAhead = nil end -- a jump: it went round the pace car, it did not pass us
   if rel > 0 then L1.seenAhead = true end -- only a car we have been behind can be passed
 
-  local mate = S.reason == 2 and idx % 2 == 0 and S.order[idx - 1] or nil -- the row mate on the rolling start
+  local double = doubleFile()
+  local mate = double and idx % 2 == 0 and S.order[idx - 1] or nil -- the row mate on the start and the restart
+  local mateBehind = double and idx % 2 == 1 and S.order[idx + 1] or nil -- beside us, a few metres ahead is no car to pass
   -- within 150 m: the nearest car ahead of us on the road and in the line that we must not run into, the
   -- nearest one to pass (behind us in the line, or too slow: we go round it, braking for it is what makes
   -- the whole field pile up) and the nearest one to let by (ahead of us in the line but behind on the road)
@@ -411,22 +475,23 @@ local function localCheck(cars, dt)
       local d = myD - behindPace(c) -- > 0: it is ahead of us on the road
       local slow = not launching and c.speedKmh < offPaceKmh()
       if i < idx and not slow and d > 0 and d < dBlock and id ~= mate then block, dBlock = c, d end
-      if (i > idx or slow) and d > 0 and d < dPass then passIt, dPass = c, d end
+      if (i > idx or slow) and d > 0 and d < dPass and not (id == mateBehind and d < 12) then passIt, dPass = c, d end
       if i < idx and d < 0 and -d < dLet and (c ~= ref or not L1.seenAhead) then letIt, dLet = c, -d end
     end
   end
 
-  local gap, speed = cfg.bunchGapM, me.speedKmh
+  local gap, speed = gapM(), me.speedKmh
   local err = myD - slotDistance(idx) -- > 0: behind our place
   local target = cfg.paceKmh + (err > 0 and clamp(err / (4 * gap), 0, 1) * cfg.catchupKmh or clamp(err / gap, -1, 0) * 20)
   if block then -- never into the car ahead: slow down early and gently (3 m/s2), not at the last moment
     local keep = S.reason == 2 and 0.6 * rowGap.m or 0.75 * gap
     target = math.min(target, block.speedKmh + 3.6 * math.sqrt(6 * math.max(0, dBlock - keep)))
   end
-  local tol = S.reason == 2 and -12 or -3 -- the grid is two abreast, a few metres either way are fine
+  local tol = double and -12 or -3 -- two abreast, a few metres either way are fine
   local leaderGo = not ref and S.phase == ONE_TO_GO -- the pace car is gone, the leader holds the pace to the line
 
   L1.ref, L1.place, L1.count, L1.rel, L1.err, L1.beside = ref, idx, #S.order, rel, err, ref ~= nil and ref.sessionID == mate
+  L1.lane = double and (idx % 2 == 1 and 'in' or 'out') or nil
   L1.target, L1.allowed = target, target + cfg.speedTolKmh
   L1.speeding = speed > L1.allowed
   L1.passing = not leaderGo and L1.seenAhead == true and rel < tol
@@ -442,6 +507,54 @@ local function localCheck(cars, dt)
   judge(dt)
 end
 
+-- Who has been in the pit lane in this deployment (the wave-around needs to know whether the leader came in),
+-- and the pit entry of the local car: going in while the pit lane is closed for it costs the place in the
+-- line (it restarts at the back), nothing else. Already in the pit lane when the caution came: no fault.
+local function watchPits(me, cars)
+  if S.phase == GREEN or S.reason == 2 then return end
+  for id, c in pairs(cars) do if c.isInPitlane then dep.pitted[id] = true end end
+  local was = dep.me.inPit
+  dep.me.inPit = me.isInPitlane
+  if was ~= false or not me.isInPitlane then return end
+  local w = pitWindow()
+  if w == 0 or (w == 1 and lapsDown(me, cars) >= 1) then
+    flagMe(TAIL)
+    penNote = { title = 'ПІТ-ЛЕЙН ЗАКРИТО', why = 'Рестарт з кінця колони', untilT = uiTime + 7 }
+    pcall(ac.setMessage, penNote.title, penNote.why, 'illegal', 7)
+    ac.log(string.format('Oval: into a closed pit lane (window %d), to the back of the line', w))
+  end
+end
+
+-- On the last lap of a caution the lucky dog (the first car a lap down, unless it caused the caution) and
+-- the wave-arounds (cars a lap or more down that stayed out while the leader pitted) go round the field:
+-- past the line and the pace car, a lap at speed, to the back of the line. That gives them their lap back.
+local function watchWave(me, cars)
+  local m = dep.me
+  if S.phase == GREEN or S.reason == 2 then return end
+  if not m.waveJudged and finalLap() then
+    m.waveJudged = true
+    if me.isInPitlane or lapsDown(me, cars) < 1 then return end
+    local lucky = me.sessionID ~= S.cause
+    for _, id in ipairs(S.order) do -- the line is the race order: a lapped car ahead of me is the lucky dog
+      if id == me.sessionID then break end
+      if cars[id] and lapsDown(cars[id], cars) >= 1 then lucky = false break end
+    end
+    local wave = not dep.pitted[me.sessionID] and dep.leader ~= nil and dep.pitted[dep.leader] == true
+    if not lucky and not wave then return end
+    m.wave, m.down = lucky and 'LUCKY DOG' or 'WAVE AROUND', lapsDown(me, cars)
+    flagMe(WAVE)
+    infoNote = { title = m.wave, why = 'ОБ\'ЇДЬ КОЛОНУ І SAFETY CAR, НАЗДОЖЕНИ КОЛОНУ ЗЗАДУ', untilT = uiTime + 8 }
+    ac.log('Oval: ' .. m.wave)
+  end
+  if m.wave and not m.joined then -- past the leader (the lap is back), then up to the last car of the line from behind
+    local d, last = behindPace(me), cars[S.order[#S.order]]
+    if lapsDown(me, cars) < m.down and last and d > behindPace(last) and d - behindPace(last) < 100 then
+      m.joined = true
+      flagMe(TAIL)
+    end
+  end
+end
+
 -- The limiter cuts the gas while the car is faster than the target of its place (works on the
 -- script's own throttle override, like the gas cut penalty). A running penalty gas cut is left alone.
 local limitLogged = false
@@ -455,18 +568,33 @@ end
 
 -- ── incidents: every client watches its own car ──────────────────────────────
 -- Own data is the only reliable data. A wreck is a sudden loss of speed (with or without a contact
--- event), a car that stays slow for stopSec is stopped: standing, or limping below limpRatio of the
--- speed it was doing. Remote cars are not watched: their data is late and the owner knows best.
+-- event), a car that stays slow on the road for stopSec is stopped: standing, or limping below limpRatio
+-- of the speed it was doing. A wreck with another car calls the caution at once. A crash on its own does
+-- not: only if the car then stays slow or stands on the road, where others come. Remote cars are not
+-- watched: their data is late and the owner knows best.
 local okHit, errHit = pcall(ac.onCarCollision, 0, function()
   lastContact = uiTime
+  local me = ac.getCar(0)
+  local withCar = me.collidedWith ~= 0 -- 0: a wall or the track; unknown (old CSP): counted as a car, as before
+  if withCar then watch.carHit = uiTime end
   local peak = watch.peak or 0
   if uiTime - (watch.hitLog or -5) > 2 then
     watch.hitLog = uiTime
-    ac.log(string.format('Oval: contact, speed=%d peak=%d', math.floor(ac.getCar(0).speedKmh), math.floor(peak)))
+    ac.log(string.format('Oval: contact with %s, speed=%d peak=%d', withCar and 'a car' or 'the track', math.floor(me.speedKmh), math.floor(peak)))
   end
   if peak > 100 then watch.hit = { t = uiTime, peak = peak } end
 end)
 if not okHit then ac.log('Oval: contact events unavailable: ' .. tostring(errHit)) end
+
+-- metres the car is beyond the edge of the road (0 on the road); unknown: on the road
+local function offRoad(c)
+  local good, m = pcall(function()
+    local t = ac.worldCoordinateToTrack(c.position)
+    local sides = ac.getTrackAISplineSides(t.z)
+    return math.max(0, (math.abs(t.x) - 1) * (t.x < 0 and sides.x or sides.y))
+  end)
+  return good and m or 0
+end
 
 local function watchSelf(dt, now)
   local me = ac.getCar(0)
@@ -491,14 +619,22 @@ local function watchSelf(dt, now)
   local hit = watch.hit
   if hit and uiTime - hit.t > 2.5 then hit = nil; watch.hit = nil end
   local recent = hit and uiTime - hit.t < 1
-  if lost(0.4) >= cfg.wreckDropKmh or (recent and lost(1) >= 35) or (hit and speed < hit.peak * 0.35) then
-    ac.log(string.format('Oval: wreck, speed=%d lost=%d contact=%s', math.floor(speed), math.floor(lost(1)), tostring(hit ~= nil)))
-    return deploy(3, me.sessionID)
+  if not watch.solo and (lost(0.4) >= cfg.wreckDropKmh or (recent and lost(1) >= 35) or (hit and speed < hit.peak * 0.35)) then
+    local withCar = uiTime - (watch.carHit or -100) < 3
+    ac.log(string.format('Oval: wreck, speed=%d lost=%d contact=%s with a car=%s', math.floor(speed), math.floor(lost(1)), tostring(hit ~= nil), tostring(withCar)))
+    if withCar then return deploy(3, me.sessionID) end
+    watch.solo = uiTime -- on its own: a caution only if it stays on the road slow (below)
   end
-  local slow = speed < cfg.slowKmh or (cfg.limpRatio > 0 and speed < cfg.limpRatio * watch.top and speed < 110)
+  if watch.solo and uiTime - watch.solo > 10 and speed > cfg.raceKmh then watch.solo = nil end -- back racing
+  local off = offRoad(me)
+  if off >= cfg.offRoadM then watch.offAt = uiTime end
+  -- off the road a car endangers nobody; back on it after a trip off, it gets a few seconds to get up to
+  -- speed before slow counts (standing still always counts)
+  local rejoining = uiTime - (watch.offAt or -100) < 8
+  local slow = off < cfg.offRoadM and (speed < cfg.slowKmh or (not rejoining and cfg.limpRatio > 0 and speed < cfg.limpRatio * watch.top and speed < 110))
   watch.slow = slow and (watch.slow or 0) + dt or 0
   if watch.slow >= cfg.stopSec then
-    ac.log(string.format('Oval: stopped car, speed=%d top=%d', math.floor(speed), math.floor(watch.top)))
+    ac.log(string.format('Oval: stopped car on the road, speed=%d top=%d off=%.1f m after a crash on its own=%s', math.floor(speed), math.floor(watch.top), off, tostring(watch.solo ~= nil)))
     deploy(1, me.sessionID)
   end
 end
@@ -529,22 +665,28 @@ end
 
 -- Cars in the pits or out of the line drop out of the order; cars that come back (or join) take
 -- their place by the race order (by the road on the rolling start), so nobody gains places by
--- pitting or by stopping. nil: nothing changed.
+-- pitting or by stopping. Cars sent to the back (a closed pit lane, back from going round the field)
+-- line up at the end in the order they were sent there; a car going round the field is not in the line.
+-- nil: nothing changed.
 local function desiredOrder(cars)
-  local order, seen = {}, {}
-  local function inLine(id, c) return not c.isInPitlane and not c.isRetired and not offPace[id] end
+  local order, seen, tail = {}, {}, {}
+  local function inLine(id, c) return not c.isInPitlane and not c.isRetired and not offPace[id] and not (dep.flags[id] and dep.flags[id].kind == WAVE) end
+  local function atTail(id) return dep.flags[id] and dep.flags[id].kind == TAIL end
   local before = S.reason == 2 and function(a, b) return behindPace(a) < behindPace(b) end or raceOrder(cars)
   for _, id in ipairs(S.order) do
     local c = cars[id]
-    if c and inLine(id, c) then order[#order + 1] = id; seen[id] = true end
+    if c and inLine(id, c) and not atTail(id) then order[#order + 1] = id; seen[id] = true end
   end
   for id, c in pairs(cars) do
-    if not seen[id] and inLine(id, c) then
+    if inLine(id, c) and atTail(id) then tail[#tail + 1] = id
+    elseif not seen[id] and inLine(id, c) then
       local at = #order + 1
       for i, other in ipairs(order) do if before(c, cars[other]) then at = i break end end
       table.insert(order, at, id)
     end
   end
+  table.sort(tail, function(a, b) return dep.flags[a].n < dep.flags[b].n end)
+  for _, id in ipairs(tail) do order[#order + 1] = id end
   while #order > ORDER_MAX do order[#order] = nil end
   if #order ~= #S.order then return order end
   for i = 1, #order do if order[i] ~= S.order[i] then return order end end
@@ -563,6 +705,14 @@ local function leaderCrossed(cars)
   lastLeader = nil
 end
 
+-- The line is put in order by one client only: the lowest session ID among the clients that run the
+-- script. Two clients that see a slow car a little differently would otherwise take turns changing it
+-- (seen in a race: 25 orders in 15 s, the places and "follow" on everybody's screen jumping).
+local function orderer(cars, me)
+  for id in pairs(presence) do if id < me.sessionID and cars[id] then return false end end
+  return true
+end
+
 local function control(cars, dt, rank)
   if S.phase == GREEN then lastLeader = nil return end
   watchPace(cars, dt)
@@ -570,8 +720,8 @@ local function control(cars, dt, rank)
     if due('announce', rank) then commit(S.phase, S.reason, S.cause, S.tStart, S.s0, S.order) end
     return
   end
-  local order = desiredOrder(cars)
-  if order and due('order', rank) then return commit(S.phase, S.reason, S.cause, S.tStart, S.s0, order) end
+  local order = orderer(cars, ac.getCar(0)) and desiredOrder(cars)
+  if order and due('order', 0) then return commit(S.phase, S.reason, S.cause, S.tStart, S.s0, order) end
 
   local len = trackLen()
   if S.phase == CAUTION then
@@ -606,7 +756,7 @@ end
 local function isActive() return cfg.everySession == 1 or sessionType() == RACE end
 local function reset()
   S, L1, watch, ctl, start, greeted, pen, penNote = freshState(), {}, {}, {}, {}, false, { strikes = 0, last = {} }, nil
-  infoNote, followKey, offPace, slowT = nil, nil, {}, {}
+  infoNote, followKey, offPace, slowT, dep, flagOut = nil, nil, {}, {}, freshDep(), nil
 end
 try('session start events', ac.onSessionStart, reset)
 
@@ -720,19 +870,20 @@ local function pitPoint(dist)
 end
 
 -- Where the pace car is drawn. The rules only know its synced point on the road; the picture adds
--- the pit lane. Out: it waits in the middle of the pit lane and drives off so that it reaches the end
--- of the pit lane at full pace just as its synced point passes there. In (one to go): from the turn-in
--- point it slows down to a stop in the middle of the pit lane. 2.5 s of lane change join the two lines.
+-- the pit lane. Out (when it starts at the pit exit): it comes out of the end of the pit lane at full
+-- pace and joins the road. In (one to go): from the turn-in point it slows down to a stop in the middle
+-- of the pit lane. 2.5 s of lane change join the two lines. Anywhere else it is simply on the road.
 -- Returns the position, the direction, the speed in m/s and "still in the pits" (nothing: not shown).
 local BLEND = 2.5
 local function paceVisual()
   local v, len = S.kmh / 3.6, trackLen()
   local p, fwd = roadFrame(pacePos())
   if S.phase == CAUTION then
-    if not pit or S.reason == 2 then return p, fwd, v, false end -- the rolling start begins on the grid
+    -- the rolling start begins on the grid; a start away from the pit exit is on the road (s0 came as a float)
+    if not pit or S.reason == 2 or math.abs(frac(S.s0 - pit.exitS + 0.5) - 0.5) > 1e-5 then return p, fwd, v, false end
     local pts = pit.pts
     local out = (pts[pit.b].d - pts[pit.a].d) / 2
-    local left = (S.tStart + frac(pit.exitS - S.s0) * len / v * 1000 - clock()) / 1000 -- seconds to the pit exit
+    local left = (S.tStart + (frac(pit.exitS - S.s0 + 0.5) - 0.5) * len / v * 1000 - clock()) / 1000 -- seconds to the pit exit (about 0)
     if left > 0 then
       local T = 2 * out / v -- from a stop to the pace over the second half of the pit lane
       local tau = math.min(left, T)
@@ -777,10 +928,10 @@ end
 
 local WHEEL_R = 0.34 -- metres, a sports car wheel
 local function updatePaceCar(dt)
-  local p, fwd, speed, inPits
-  if isActive() and S.phase ~= GREEN then p, fwd, speed, inPits = paceVisual() end
+  local p, fwd, speed
+  if isActive() and S.phase ~= GREEN then p, fwd, speed = paceVisual() end
   local show = p ~= nil
-  car3d.inPits, car3d.frame = show and inPits, show and { p = p, up = vec3(0, 1, 0) } or nil
+  car3d.frame = show and { p = p, up = vec3(0, 1, 0) } or nil
   if show and car3d.state == 'idle' and cfg.paceModel ~= '' then loadPaceCar() end
   if car3d.state ~= 'ready' then return end
   if car3d.visible ~= show then car3d.visible = show; car3d.root:setVisible(show) end
@@ -818,11 +969,6 @@ local function drawPaceCar()
   elseif f then
     render.debugText(f.p + f.up * 3.6, 'SAFETY CAR', YELLOW, 1.5)
   end
-  if car3d.inPits and S.phase == CAUTION then -- the leader follows its point on the road while it is still in the pits
-    local q = ac.trackCoordinateToWorld(vec3(0, 0, pacePos()))
-    render.debugArrow(q + vec3(0, 14, 0), q + vec3(0, 2, 0), 1.5, YELLOW)
-    render.debugText(q + vec3(0, 16, 0), 'SAFETY CAR ВИЇЖДЖАЄ З БОКСІВ', YELLOW, 2)
-  end
 end
 
 function script.update(dt)
@@ -843,6 +989,10 @@ function script.update(dt)
         ac.log('Oval: a message has not gone out for 5 s (rate limit, or the server does not pass client messages)')
       end
     end
+    if flagOut and sendFlag and not outbox then -- the state goes first, the flag in a later frame (rate limit)
+      accessFlag().kind = flagOut
+      if sendFlag(nil, false) then flagOut = nil end
+    end
     if not isActive() then if S.seq > 0 then reset() end return end
     if pit == nil then loadPit() end
 
@@ -852,10 +1002,10 @@ function script.update(dt)
     hudCars, hudRank = cars, rank
     if S.phase == GREEN then startRace(cars, rank, now); watchSelf(dt, now) end
     control(cars, dt, rank)
+    watchPits(me, cars)
+    watchWave(me, cars)
     localCheck(cars, dt)
     limit(me)
-    servePenalty(me)
-    handOutOwed()
     watchGamePenalty(me)
     updatePaceCar(dt)
   end)()
@@ -877,14 +1027,16 @@ local function drawDebug()
   local ids = {}
   for id in pairs(presence) do ids[#ids + 1] = id end
   table.sort(ids)
-  ui.dwriteDrawText(string.format('penalty %s  strikes %d  drive-through due %s pending %s  server penalties %s', cfg.penalty, pen.strikes, tostring(pen.owed == true), tostring(pen.driving == true), tostring(sim.penaltiesEnabled)), 13, vec2(12, 90), yel)
+  local flags = {}
+  for id, f in pairs(dep.flags) do flags[#flags + 1] = id .. ':' .. f.kind end
+  ui.dwriteDrawText(string.format('penalty %s  strikes %d  pit window %d  flags %s  wave %s  server penalties %s', cfg.penalty, pen.strikes, S.phase == GREEN and -1 or pitWindow(), table.concat(flags, ' '), tostring(dep.me.wave), tostring(sim.penaltiesEnabled)), 13, vec2(12, 90), yel)
   ui.dwriteDrawText(string.format('CSP %s  race %s  direct %s  sent %d got %d stale %d  script on: %s', tostring(build), tostring(sessionType()), tostring(sim.directMessagingAvailable),
     stats.sent, stats.got, stats.stale, table.concat(ids, ',')), 13, vec2(12, 74), yel)
 end
 
 -- Where the boxes stand (share of the screen: middle of a box, its top). The player drags them with the mouse
 -- after !hud or from the online extras of the chat app; ac.storage keeps them on his PC.
-local HUD_DEFAULT = { topX = 0.5, topY = 50 / 1080, noteX = 0.5, noteY = 0.3, debtX = 0.5, debtY = 0.8 }
+local HUD_DEFAULT = { topX = 0.5, topY = 50 / 1080, noteX = 0.5, noteY = 0.3 }
 local okHud, hud = pcall(ac.storage, HUD_DEFAULT, 'ovalHud.')
 if not okHud or type(hud) ~= 'table' then hud = {}; for key, v in pairs(HUD_DEFAULT) do hud[key] = v end end
 local toolSeen, drag, boxes = -100, nil, {}
@@ -983,15 +1135,6 @@ function script.drawUI()
       centered(info.title, 36 * k, cx, y0 + 8 * k, BLACK)
       rich(why, k, cx, y0 + 56 * k, BLACK)
     end
-    local debt = pen.driving and 'ПРОЇЗД ПІТ-ЛЕЙНУ: ЗАЇЖДЖАЙ НА ПІТ-ЛЕЙН' or pen.owed and 'ПРОЇЗД ПІТ-ЛЕЙНУ ПІСЛЯ ЗЕЛЕНОГО ПРАПОРА'
-      or edit and 'ПРОЇЗД ПІТ-ЛЕЙНУ ПІСЛЯ ЗЕЛЕНОГО ПРАПОРА'
-    if debt then
-      local dx, dy = hud.debtX * win.x, hud.debtY * win.y
-      local hw = halfW(k, 600, { { { debt, 22 } } })
-      ui.drawRectFilled(vec2(dx - hw, dy), vec2(dx + hw, dy + 44 * k), RED, 10 * k)
-      box('debt', dx - hw, dy, dx + hw, dy + 44 * k, edit)
-      centered(debt, 22 * k, dx, dy + 8 * k, rgbm(1, 1, 1, 1))
-    end
     local showGreen = S.phase == GREEN and S.seq > 0 and clock() - S.tStart < 5000
     local demo = edit and (not isActive() or S.phase == GREEN and not showGreen)
     if S.phase == GREEN and not showGreen and not demo then return end
@@ -1010,14 +1153,24 @@ function script.drawUI()
       title, bg = TITLES[S.reason] or TITLES[0], YELLOW
       local who = hudCars[S.cause]
       if S.reason == 2 then add('ТРИМАЙ СВІЙ РЯД - ЗЕЛЕНИЙ НА ЛІНІЇ') elseif who then add(ac.getDriverName(who.index)) end
-      if car3d.inPits then add('SAFETY CAR ВИЇЖДЖАЄ З БОКСІВ - ТРИМАЙ ТЕМП') end
+      if S.reason ~= 2 then
+        local w, lapped = pitWindow(), L1.down and L1.down > 0
+        add(w == 0 and 'ПІТ-ЛЕЙН ЗАКРИТО' or w == 1 and (lapped and 'ПІТ-ЛЕЙН ЛИШЕ ДЛЯ ЛІДЕРСЬКОГО КОЛА - ТОБІ ЩЕ ЗАКРИТО' or 'ПІТ-ЛЕЙН ВІДКРИТО ДЛЯ ЛІДЕРСЬКОГО КОЛА') or 'ПІТ-ЛЕЙН ВІДКРИТО')
+      end
     end
     if not showGreen and not demo then
-      if L1.out then
+      local mine = dep.flags[ac.getCar(0).sessionID]
+      if dep.me.wave and not dep.me.joined then
+        lines[#lines + 1] = { { dep.me.wave, 30 } }
+        add('ОБ\'ЇДЬ КОЛОНУ І SAFETY CAR, НАЗДОЖЕНИ КОЛОНУ ЗЗАДУ')
+      elseif L1.out then
         add('ТИ ПОЗА КОЛОНОЮ: НАБЕРИ ШВИДКІСТЬ')
       elseif L1.place then
+        if mine and mine.kind == TAIL and not dep.me.joined then add('РЕСТАРТ З КІНЦЯ КОЛОНИ (ПІТ-ЛЕЙН БУВ ЗАКРИТИЙ)') end
         local place = {}
-        if S.reason == 2 then place = { { 'РЯД  ', 18 }, { tostring(math.ceil(L1.place / 2)), 30 }, { '     ', 18 } } end
+        if L1.lane then
+          place = { { 'РЯД  ', 18 }, { tostring(math.ceil(L1.place / 2)), 30 }, { L1.lane == 'in' and '  ВНУТРІШНІЙ     ' or '  ЗОВНІШНІЙ     ', 18 } }
+        end
         place[#place + 1] = { 'МІСЦЕ  ', 18 }
         place[#place + 1] = { tostring(L1.place), 30 }
         place[#place + 1] = { '  З ' .. L1.count .. ' У КОЛОНІ', 18 }
@@ -1092,4 +1245,4 @@ pcall(function() ac.log(string.format('Oval: %s loaded, CSP %s, me=%d cars=%d ra
 pcall(function() local s = ac.getSession(sim.currentSessionIndex); ac.log(string.format('Oval: session laps=%s timed=%s minutes=%s', tostring(s.laps), tostring(s.isTimedRace), tostring(s.durationMinutes))) end)
 
 -- Offline tests load this file with a fake `ac` and read the internals from here.
-if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, pen = function() return pen end, note = function() return penNote end, info = function() return infoNote end, stats = function() return stats end, hud = function() return hud end } end
+if OVAL_TEST then return { state = function() return S end, local1 = function() return L1 end, watch = function() return watch end, pacePos = pacePos, lastError = function() return lastError end, presence = function() return presence end, pen = function() return pen end, note = function() return penNote end, info = function() return infoNote end, stats = function() return stats end, hud = function() return hud end, dep = function() return dep end, pitWindow = pitWindow } end
