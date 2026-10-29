@@ -835,6 +835,20 @@ local function scenarioClearRoad()
   end
   check(worst >= 0, string.format('every car has its braking room behind the pace car (tightest: car %d, %.0f m to spare)', who, worst))
   check(frac(s0 - 0.5) * TRACK > 700, 'it appears past both lapped cars (' .. math.floor(frac(s0 - 0.5) * TRACK) .. ' m ahead of the leader)')
+
+  print('== the pace car does not appear on top of a car either')
+  resetWorld()
+  local pace = W.defaults.paceKmh
+  for i = 1, 4 do addCar(i, 0.5 - (i - 1) * 45 / TRACK, pace) end
+  addCar(9, 0.5 + 310 / TRACK, pace, { lapCount = -1 }) -- 10 m past the point 300 m ahead of the leader
+  for _, c in ipairs({ table.unpack(W.cars) }) do addClient(c, c.sessionID == 1) end
+  run(1)
+  W.clients[1].chat('!yellow')
+  s0 = W.clients[1].oval.state().s0
+  local lapped
+  for _, c in ipairs(W.cars) do if c.sessionID == 9 then lapped = c end end
+  local aheadM, behindM = frac(lapped.splinePosition - s0) * TRACK, frac(s0 - lapped.splinePosition) * TRACK
+  check(aheadM > 30 and behindM >= 50, string.format('not right behind the lapped car: it is %.0f m behind it, the lapped car %.0f m behind the pace car', math.min(aheadM, 9999), behindM))
 end
 
 local function scenarioOldCsp()
@@ -1123,6 +1137,23 @@ local function scenarioPitRules()
   check(next(cl.oval.dep().flags) == nil, 'the green flag clears the list')
 end
 
+local function scenarioReYellow()
+  print('== a second !yellow during a caution starts a new one with a clean sheet')
+  local byId = lappedField(true)
+  byId[3].isInPitlane = true -- into the closed pit lane
+  run(1)
+  byId[3].isInPitlane = false
+  run(2)
+  check(flagOf(1, 3) == 1, 'car 3 is sent to the back in the first caution')
+  local t1 = W.clients[1].oval.state().tStart
+  W.clients[1].chat('!yellow')
+  run(1)
+  for _, c in ipairs(W.clients) do
+    local st = c.oval.state()
+    check(st.tStart ~= t1 and next(c.oval.dep().flags) == nil and c.oval.pitWindow() == 0, 'client ' .. c.car.sessionID .. ': a new caution, no flags from the old one, the pit lane closed again')
+  end
+end
+
 local function scenarioWave()
   print('== the lucky dog and a wave-around go round the field about two laps before the green, the line doubles up on the last lap')
   local byId = lappedField(false)
@@ -1216,6 +1247,7 @@ scenarioModel()
 scenarioPitLane()
 scenarioClearRoad()
 scenarioPitRules()
+scenarioReYellow()
 scenarioWave()
 scenarioPenalties()
 scenarioGrid()

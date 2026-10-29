@@ -99,7 +99,8 @@ local function adopt(new) -- local state survives order updates of the same depl
   if new.seq ~= S.seq or new.from ~= S.from then
     ac.log(string.format('Oval: state seq=%d from=%d phase=%d reason=%d cause=%d cars=%d clock=%d', new.seq, new.from, new.phase, new.reason, new.cause, #new.order, math.floor(clock())))
   end
-  if new.phase == CAUTION and S.phase == GREEN or new.phase == GREEN and S.phase ~= GREEN then -- a new deployment, or the end of one: a clean sheet
+  -- a new deployment (from green, or a second !yellow during a caution), or the end of one: a clean sheet
+  if new.phase == CAUTION and (S.phase ~= CAUTION or new.tStart ~= S.tStart) or new.phase == GREEN and S.phase ~= GREEN then
     pen.strikes, pen.last, dep = 0, {}, freshDep()
   end
   S = new
@@ -278,13 +279,14 @@ local function brakeRoom(c)
 end
 
 -- The pace car never pops up in front of a fast car: it appears at the first point from `from` on that has
--- every car (not in the pits) at least its braking room behind it. The pit exit is better when it is such a
--- point and not much further: there the pace car comes out of the pit lane. Nowhere clear: `from`.
+-- every car (not in the pits) at least its braking room behind it, and none right on top of it (30 m ahead).
+-- The pit exit is better when it is such a point and not much further: there the pace car comes out of the
+-- pit lane. Nowhere clear: `from`.
 local function clearPoint(cars, headS, from)
   local len = trackLen()
   local function blocker(p)
     for _, c in pairs(cars) do
-      if not c.isInPitlane and frac(p - c.splinePosition) * len < brakeRoom(c) then return c end
+      if not c.isInPitlane and (frac(p - c.splinePosition) * len < brakeRoom(c) or frac(c.splinePosition - p) * len < 30) then return c end
     end
   end
   local p, moved = from, 0
